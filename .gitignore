@@ -5,6 +5,7 @@ __pycache__/
 *.pyc
 *.egg-info/
 runs/
+local_tools/
 workspace/*
 !workspace/products.md
 !workspace/requirements.json

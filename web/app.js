@@ -3,10 +3,13 @@
 // The browser only talks to the local host; provider credentials stay in its config.
 const $ = (id) => document.getElementById(id);
 const state = {
-  config: { provider: "openai", model: "", base_url: "", has_api_key: false, configured: false },
+  config: { provider: "openai", model: "", base_url: "", has_api_key: false, configured: false,
+    max_steps: 80, has_search_api_key: false },
   sessions: [], files: [], session: null, attachments: [], drafts: new Map(),
   revision: 0, poll: null, sending: false, uploading: false, selecting: false, initialized: false,
   messagesSignature: "", traceSignature: "", toastTimer: null,
+  toolInventory: { tools: [], saved_tools: [], tool_errors: [] },
+  toolsRequest: 0, toolsRun: null, searchKeyRemoved: false,
 };
 const active = (run) => run && ["running", "stopping"].includes(run.status);
 const busy = () => state.sending || state.uploading || state.selecting;
@@ -90,7 +93,11 @@ function renderConfig() {
     ? `${providerName(state.config.provider)} · ${state.config.model}` : "尚未配置模型";
   const model = state.session || (state.config.configured ? state.config : null);
   $("model-line").hidden = !model;
-  $("model-line").textContent = model ? `${providerName(model.provider)} / ${model.model}` : "";
+  const limit = model?.max_steps === null ? "不限调用次数" : `至多 ${model?.max_steps ?? 80} 次调用`;
+  const searching = Boolean(model?.search_enabled ?? model?.has_search_api_key);
+  $("model-line").textContent = model
+    ? `${providerName(model.provider)} / ${model.model} · ${limit} · ${searching ? "搜索已启用" : "搜索未配置"}` : "";
+  $("model-line").title = $("model-line").textContent;
 }
 
 function renderSessions() {
@@ -165,6 +172,80 @@ function renderFiles() {
     button.addEventListener("click", () => { attach(file.name); toast(`已添加 ${file.name}`); });
     row.append(icon("file"), info, button); holder.append(row);
   }
+}
+
+function renderTools() {
+  const { tools, saved_tools: saved, tool_errors: errors } = state.toolInventory;
+  const holder = $("saved-tools-list");
+  const expanded = new Set([...holder.querySelectorAll("details[open]")].map((item) => item.dataset.tool));
+  const scroll = $("tools-dialog").scrollTop;
+  const savedNames = new Set(saved.map((tool) => tool.name));
+  const descriptions = {
+    list_files: "列出工作文件。", read_file: "读取文本文件，支持分段查看。",
+    run_python: "编写并运行 Python，处理本机工作文件。",
+    create_tool: "测试代码并保存为可重复调用的工具。",
+    web_search: "使用 DeepSeek 搜索网页并返回来源。",
+    fetch_webpage: "读取指定网页的正文内容。",
+  };
+  const builtin = $("builtin-tools-list"); builtin.replaceChildren();
+  for (const tool of tools.filter((item) => !savedNames.has(item.name))) {
+    const row = node("div", "builtin-tool");
+    row.append(node("code", "", tool.name), node("p", "", descriptions[tool.name] || tool.description));
+    builtin.append(row);
+  }
+  holder.replaceChildren(); $("saved-tools-count").textContent = String(saved.length);
+  if (!saved.length) holder.append(node("p", "tools-empty", "还没有保存的工具。在对话中说“帮我创建一个……”即可开始。"));
+  for (const tool of saved) {
+    const item = node("details", "saved-tool");
+    item.dataset.tool = tool.name; item.open = expanded.has(tool.name);
+    const summary = node("summary");
+    summary.append(node("strong", "", tool.name), node("span", "", tool.description));
+    item.append(summary);
+    const updated = new Date(tool.updated_at);
+    if (!Number.isNaN(updated.getTime())) item.append(node("p", "tool-updated", `更新于 ${updated.toLocaleString("zh-CN", { hour12: false })}`));
+    const sourceHeading = node("div", "tool-source-heading");
+    const copy = node("button", "text-button", "复制代码"); copy.type = "button";
+    copy.addEventListener("click", async () => {
+      try { await navigator.clipboard.writeText(tool.code || ""); toast("代码已复制"); }
+      catch { toast("复制未成功，请选中代码后复制。"); }
+    });
+    sourceHeading.append(node("span", "", "Python 源码"), copy);
+    item.append(sourceHeading, node("pre", "tool-source", tool.code || ""),
+      node("div", "tool-example-heading", "测试输入示例"),
+      node("pre", "tool-example", JSON.stringify(tool.example_arguments ?? {}, null, 2)));
+    holder.append(item);
+  }
+  const warnings = errors.map((error) => typeof error === "string" ? error
+    : `${error.name || error.file || "工具"}：${error.message || error.error || "无法加载，请检查本机工具文件。"}`);
+  formError("tools-warning", warnings.length ? `部分工具未能加载：\n${warnings.join("\n")}` : "");
+  $("tools-dialog").scrollTop = scroll;
+}
+
+async function refreshTools() {
+  const request = ++state.toolsRequest;
+  $("tools-loading").hidden = false; $("refresh-tools").disabled = true;
+  formError("tools-error", "");
+  try {
+    const result = await api("/api/tools");
+    if (request !== state.toolsRequest) return;
+    if (!Array.isArray(result.tools) || !Array.isArray(result.saved_tools) || !Array.isArray(result.tool_errors)) {
+      throw new Error("工具列表格式无效，请重新启动本地服务后重试。");
+    }
+    state.toolInventory = result; renderTools();
+  } catch (error) {
+    if (request === state.toolsRequest) formError("tools-error", error.message);
+  } finally {
+    if (request === state.toolsRequest) {
+      $("tools-loading").hidden = true; $("refresh-tools").disabled = false;
+    }
+  }
+}
+
+async function openTools() {
+  if (busy()) return;
+  renderTools(); $("tools-dialog").showModal();
+  if (state.session?.run && !active(state.session.run)) state.toolsRun = state.session.run.id;
+  await refreshTools();
 }
 
 // A deliberately small Markdown renderer. External text never becomes HTML.
@@ -284,20 +365,24 @@ function renderRun() {
   // Freeze state changes while a local send, upload, or session switch is pending.
   // Once the POST is acknowledged, a running model does not block drafting the next turn.
   $("message-input").readOnly = state.sending || state.selecting;
-  for (const id of ["new-chat", "open-settings", "open-files", "attach-file",
-    "summarize-file", "analyze-question", "upload-files"]) $(id).disabled = busy();
+  for (const id of ["new-chat", "open-settings", "open-files", "open-tools", "attach-file",
+    "summarize-file", "create-tool-prompt", "search-web-prompt", "upload-files"]) $(id).disabled = busy();
   $("session-list").querySelectorAll("button").forEach((item) => { item.disabled = busy(); });
   $("attachments").querySelectorAll("button").forEach((item) => { item.disabled = busy(); });
   $("file-list").querySelectorAll("button").forEach((item) => {
     item.disabled = busy() || item.classList.contains("selected");
   });
-  renderTrace();
+  if ($("trace-dialog").open) renderTrace();
 }
 
-function renderTrace() {
+function renderTrace(force = false) {
+  if (!$("trace-dialog").open) return;
   const run = state.session?.run;
-  const signature = JSON.stringify(run);
-  if (signature === state.traceSignature) return;
+  const events = run?.events || [];
+  const omitted = run?.omitted_events || 0;
+  const signature = run ? JSON.stringify([run.id, run.status, run.step,
+    run.event_count ?? events.length, omitted]) : "no-run";
+  if (!force && signature === state.traceSignature) return;
   state.traceSignature = signature;
   const holder = $("trace-list");
   const opened = new Set([...holder.querySelectorAll("details[open]")].map((item) => item.dataset.key));
@@ -305,9 +390,9 @@ function renderTrace() {
   holder.replaceChildren();
   if (!run) { holder.append(node("p", "empty-list", "发送一个任务后，这里会显示运行过程。")); return; }
   const statuses = { running: "正在运行", stopping: "正在停止", completed: "已完成", error: "运行失败", cancelled: "已停止" };
-  $("trace-subtitle").textContent = `${statuses[run.status] || run.status} · ${run.step} 次模型请求`;
-  let index = 0;
-  for (const event of run.events || []) {
+  $("trace-subtitle").textContent = `${statuses[run.status] || run.status} · ${run.step} 次模型请求` +
+    (omitted ? ` · 仅显示最近 ${events.length} 条记录；已省略 ${omitted} 条，完整记录见本机 runs 文件夹。` : "");
+  for (const [index, event] of events.entries()) {
     const data = event.data || {};
     let title, description = "", details = null, kind = "";
     if (event.event === "run_start") { title = "任务开始"; }
@@ -325,6 +410,9 @@ function renderTrace() {
       kind = data.status === "completed" ? "success" : data.status === "cancelled" ? "" : "error";
       description = data.error || "";
     } else continue;
+    if (data.truncated || data.result?.truncated || data.error?.truncated) {
+      description = `${description ? `${description} · ` : ""}当前显示截断预览，完整内容见本机 runs 文件夹。`;
+    }
     const row = node("section", `trace-event ${kind}`);
     const head = node("div", "trace-title");
     const time = new Date(event.time);
@@ -333,12 +421,12 @@ function renderTrace() {
     if (description) row.append(node("p", "", description));
     if (details !== null && details !== undefined) {
       const disclosure = node("details");
-      disclosure.dataset.key = `${run.id}-${index}`;
+      disclosure.dataset.key = `${run.id}-${omitted + index}`;
       disclosure.open = opened.has(disclosure.dataset.key);
       disclosure.append(node("summary", "", event.event === "tool_call" ? "查看参数" : "查看结果"), node("pre", "", String(details)));
       row.append(disclosure);
     }
-    holder.append(row); index++;
+    holder.append(row);
   }
   $("trace-dialog").scrollTop = scroll;
 }
@@ -346,6 +434,11 @@ function renderTrace() {
 function renderSession(force = false) {
   $("conversation-title").textContent = state.session?.title || "新对话";
   renderConfig(); renderSessions(); renderMessages(force); renderRun();
+  const run = state.session?.run;
+  if ($("tools-dialog").open && run && !active(run) && state.toolsRun !== run.id) {
+    state.toolsRun = run.id;
+    refreshTools();
+  }
 }
 
 async function refreshSessions() {
@@ -473,6 +566,21 @@ function updateSettingHints() {
     ? "https://api.anthropic.com" : "https://api.openai.com/v1";
 }
 
+function updateSearchKeyHint() {
+  const removed = state.searchKeyRemoved;
+  const saved = Boolean(state.config.has_search_api_key);
+  $("search-api-key").disabled = removed;
+  $("toggle-search-key").disabled = removed;
+  $("search-api-key").placeholder = removed ? "保存后移除搜索密钥"
+    : saved ? "已保存，留空继续使用" : "填写 DeepSeek API Key";
+  $("search-key-hint").textContent = removed
+    ? "保存后停用联网搜索；撤销清除可保留已有密钥。"
+    : saved ? "已保存搜索密钥；留空保留原值。密钥仅保存在本机。"
+      : "填入后启用网页搜索与正文读取，可配合任一模型使用。";
+  $("clear-search-key").hidden = !saved;
+  $("clear-search-key").textContent = removed ? "撤销清除" : "清除已保存的 Key";
+}
+
 function openSettings() {
   if (busy()) return;
   $("provider").value = state.config.provider;
@@ -481,29 +589,43 @@ function openSettings() {
   $("toggle-key").setAttribute("aria-pressed", "false");
   $("toggle-key").setAttribute("aria-label", "显示 API Key");
   $("base-url").value = state.config.base_url || "";
-  updateSettingHints(); formError("settings-error", "");
+  $("max-steps").value = state.config.max_steps === null ? "unlimited" : String(state.config.max_steps ?? 80);
+  state.searchKeyRemoved = false;
+  $("search-api-key").value = ""; $("search-api-key").type = "password";
+  $("toggle-search-key").setAttribute("aria-pressed", "false");
+  $("toggle-search-key").setAttribute("aria-label", "显示搜索 API Key");
+  updateSettingHints(); updateSearchKeyHint(); formError("settings-error", "");
   $("settings-dialog").showModal();
 }
 
 async function saveSettings(event) {
   event.preventDefault();
-  const button = $("save-settings"); button.disabled = true;
-  const close = $("settings-dialog").querySelector("[data-close]"); close.disabled = true;
+  const button = $("save-settings");
+  if (button.disabled) return;
+  const payload = {
+    provider: $("provider").value, model: $("model").value.trim(),
+    api_key: $("api-key").value.trim(), base_url: $("base-url").value.trim(),
+    max_steps: $("max-steps").value === "unlimited" ? null : Number($("max-steps").value),
+    search_api_key: state.searchKeyRemoved ? null : $("search-api-key").value.trim(),
+  };
+  const controls = [...$("settings-form").querySelectorAll("input, select, button")];
+  const disabledBefore = controls.map((control) => control.disabled);
+  controls.forEach((control) => { control.disabled = true; });
   button.textContent = "正在保存…"; formError("settings-error", "");
   const preserved = { text: $("message-input").value, attachments: [...state.attachments] };
   try {
-    const result = await api("/api/config", {
-      provider: $("provider").value, model: $("model").value.trim(),
-      api_key: $("api-key").value.trim(), base_url: $("base-url").value.trim(),
-    });
-    state.config = result.config; $("api-key").value = "";
+    const result = await api("/api/config", payload);
+    state.config = result.config; $("api-key").value = ""; $("search-api-key").value = "";
     $("settings-dialog").close();
     newChat();
     $("message-input").value = preserved.text; state.attachments = preserved.attachments;
     resizeInput(); renderAttachments(); saveDraft(); renderConfig();
-    toast("模型已配置，新对话将使用这份设置。");
+    toast("设置已保存，新对话将使用这份配置。");
   } catch (error) { formError("settings-error", error.message); }
-  finally { button.disabled = false; close.disabled = false; button.textContent = "保存设置"; }
+  finally {
+    controls.forEach((control, index) => { control.disabled = disabledBefore[index]; });
+    button.textContent = "保存设置";
+  }
 }
 
 async function openFiles() {
@@ -544,7 +666,9 @@ function bindEvents() {
   $("new-chat").addEventListener("click", newChat);
   $("open-settings").addEventListener("click", openSettings);
   $("settings-form").addEventListener("submit", saveSettings);
-  $("settings-dialog").addEventListener("close", () => { $("api-key").value = ""; });
+  $("settings-dialog").addEventListener("close", () => {
+    $("api-key").value = ""; $("search-api-key").value = ""; state.searchKeyRemoved = false;
+  });
   $("settings-dialog").addEventListener("cancel", (event) => {
     if ($("save-settings").disabled) event.preventDefault();
   });
@@ -555,6 +679,17 @@ function bindEvents() {
     $("api-key").type = show ? "text" : "password";
     $("toggle-key").setAttribute("aria-label", show ? "隐藏 API Key" : "显示 API Key");
     $("toggle-key").setAttribute("aria-pressed", String(show));
+  });
+  $("toggle-search-key").addEventListener("click", () => {
+    const show = $("search-api-key").type === "password";
+    $("search-api-key").type = show ? "text" : "password";
+    $("toggle-search-key").setAttribute("aria-label", show ? "隐藏搜索 API Key" : "显示搜索 API Key");
+    $("toggle-search-key").setAttribute("aria-pressed", String(show));
+  });
+  $("clear-search-key").addEventListener("click", () => {
+    state.searchKeyRemoved = !state.searchKeyRemoved;
+    $("search-api-key").value = "";
+    updateSearchKeyHint();
   });
   document.querySelectorAll("[data-close]").forEach((button) => {
     button.addEventListener("click", () => $(button.dataset.close).close());
@@ -576,18 +711,27 @@ function bindEvents() {
     }
   });
   $("open-files").addEventListener("click", openFiles);
+  $("open-tools").addEventListener("click", openTools);
+  $("refresh-tools").addEventListener("click", refreshTools);
   $("attach-file").addEventListener("click", openFiles);
   $("summarize-file").addEventListener("click", () => {
     if (!$("message-input").value) $("message-input").value = "请总结这份文件的主要内容和关键结论。";
     saveDraft(); openFiles();
   });
-  $("analyze-question").addEventListener("click", () => {
-    if (!$("message-input").value) $("message-input").value = "请帮我分析这个问题：";
-    $("message-input").focus(); saveDraft();
+  $("create-tool-prompt").addEventListener("click", () => {
+    if (!$("message-input").value) $("message-input").value = "帮我创建一个文本统计工具：输入一段文本，返回字符数和行数。请先测试，再保存。";
+    $("message-input").focus(); resizeInput(); saveDraft();
+  });
+  $("search-web-prompt").addEventListener("click", () => {
+    if (!$("message-input").value) $("message-input").value = "请搜索这个主题的最新资料，并附上来源链接：";
+    $("message-input").focus(); resizeInput(); saveDraft();
+    if (!(state.session?.search_enabled ?? state.config.has_search_api_key)) {
+      toast("在模型设置中填入 DeepSeek 搜索 API Key 后可启用搜索。");
+    }
   });
   $("upload-files").addEventListener("click", () => $("file-input").click());
   $("file-input").addEventListener("change", uploadFiles);
-  $("open-trace").addEventListener("click", () => { renderTrace(); $("trace-dialog").showModal(); });
+  $("open-trace").addEventListener("click", () => { $("trace-dialog").showModal(); renderTrace(true); });
 }
 
 async function initialize() {

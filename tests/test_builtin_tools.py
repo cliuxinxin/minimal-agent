@@ -37,14 +37,8 @@ class BuiltinTests(unittest.TestCase):
             self.skipTest('symlinks not available on this platform')
         self.assertFalse(self.tools['read_file'].execute({'path': 'link.txt'})['ok'])
 
-    def test_calculator_arithmetic(self):
-        result = self.tools['calculate'].execute({'expression': '(200 + 100) * 0.9'})
-        self.assertEqual(result, {'ok': True, 'result': 270.0})
-
-    def test_calculator_rejects_code_and_unbounded_arithmetic(self):
-        for expression in ['__import__("os").getcwd()', '2 ** 1000000', 'True + 1', '1 / 0']:
-            with self.subTest(expression=expression):
-                self.assertFalse(self.tools['calculate'].execute({'expression': expression})['ok'])
+    def test_builtin_registry_contains_only_workspace_readers(self):
+        self.assertEqual(set(self.tools), {'list_files', 'read_file'})
 
     def test_list_files_returns_relative_names(self):
         result = self.tools['list_files'].execute({})

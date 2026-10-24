@@ -31,7 +31,7 @@ class ConfigTests(unittest.TestCase):
         self.write()
         agent = load_agent()
         self.assertIsInstance(agent.model, OpenAIModel)
-        self.assertEqual(set(agent.tools), {'list_files', 'read_file', 'calculate'})
+        self.assertEqual(set(agent.tools), {'list_files', 'read_file', 'run_python', 'create_tool'})
 
     def test_anthropic_default_and_custom_base(self):
         self.write('anthropic', base_url='https://gateway.example')

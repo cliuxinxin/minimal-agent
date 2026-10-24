@@ -3,6 +3,7 @@ import json
 import threading
 import unittest
 
+import miniagent.tools as tool_runtime
 from miniagent.agent import Agent
 from miniagent.model import ModelReply, ToolCall
 from miniagent.tools import Tool, ToolArgs
@@ -13,9 +14,11 @@ class ScriptedModel:
     def __init__(self, *responses):
         self.responses = iter(responses)
         self.calls = []
+        self.definitions = []
 
     def complete(self, messages, tools, system_prompt):
         self.calls.append(copy.deepcopy(messages))
+        self.definitions.append(copy.deepcopy(tools))
         response = next(self.responses)
         if isinstance(response, Exception):
             raise response
@@ -211,6 +214,138 @@ class AgentTests(unittest.TestCase):
                 raise TimeoutError('request timed out')
         result = Agent(StoppingModel()).run('task', should_stop=stop.is_set)
         self.assertEqual((result.status, result.answer, result.error), ('cancelled', '', None))
+
+    def test_default_allows_progress_beyond_eight_requests(self):
+        model = ScriptedModel(*(call(a=i, b=1) for i in range(12)), final())
+        agent = Agent(model, [self.tool])
+        result = agent.run('keep making progress')
+        self.assertEqual(agent.max_steps, 80)
+        self.assertEqual((result.status, result.steps), ('completed', 13))
+        self.assertEqual(len(self.executed), 12)
+
+    def test_default_limit_stops_before_request_eighty_one(self):
+        model = ScriptedModel(*(call(a=i, b=1) for i in range(80)), final())
+        result = Agent(model, [self.tool]).run('long task')
+        self.assertEqual((result.status, result.steps), ('step_limit', 80))
+        self.assertEqual(len(model.calls), 80)
+        self.assertEqual(len(self.executed), 80)
+
+    def test_unlimited_count_can_finish_after_eighty_requests(self):
+        model = ScriptedModel(*(call(a=i, b=1) for i in range(81)), final())
+        result = Agent(model, [self.tool], max_steps=None).run('long task')
+        self.assertEqual((result.status, result.steps), ('completed', 82))
+
+    def test_invalid_step_limits_are_rejected(self):
+        for limit in (0, -1, True, False, 1.5, '80'):
+            with self.subTest(limit=limit), self.assertRaises(ValueError):
+                Agent(ScriptedModel(), max_steps=limit)
+
+    def test_consecutive_failed_rounds_stall_and_complete_native_results(self):
+        model = ScriptedModel(*(call('missing', value=i) for i in range(8)), final())
+        agent = Agent(model, [self.tool], max_steps=800)
+        result = agent.run('unrecoverable task')
+        self.assertEqual((result.status, result.steps, result.answer), ('stalled', 8, ''))
+        self.assertIn('8', result.error)
+        self.assertEqual(agent.history[-1]['role'], 'tool')
+        self.assertEqual(json.loads(agent.history[-1]['content'])['error']['code'], 'unknown_tool')
+        self.assertEqual(len(model.calls), 8)
+
+    def test_identical_successful_rounds_stall_without_counting_call_ids(self):
+        responses = []
+        for i in range(8):
+            args = '{"a":1,"b":2}' if i % 2 else '{ "b": 2, "a": 1 }'
+            response = calls(('add', args))
+            response.tool_calls[0].id = str(i)
+            response.message['tool_calls'][0]['id'] = str(i)
+            responses.append(response)
+        model = ScriptedModel(*responses, final())
+        agent = Agent(model, [self.tool], max_steps=800)
+        result = agent.run('stuck loop')
+        self.assertEqual((result.status, result.steps), ('stalled', 8))
+        self.assertEqual(len(self.executed), 8)
+        self.assertEqual(agent.history[-1]['tool_call_id'], '7')
+
+    def test_changing_results_do_not_trigger_repeated_round_guard(self):
+        counter = iter(range(12))
+        tool = Tool('add', 'Read changing data.', AddArgs, lambda a, b: next(counter), read_only=True)
+        model = ScriptedModel(*(call(a=1, b=2) for _ in range(12)), final())
+        result = Agent(model, [tool], max_steps=80).run('watch changing results')
+        self.assertEqual((result.status, result.steps), ('completed', 13))
+
+    def test_successful_round_resets_failure_guard(self):
+        responses = ([call('missing', value=i) for i in range(7)] + [call(a=1, b=2)] +
+                     [call('missing', value=i) for i in range(7)] + [final()])
+        result = Agent(ScriptedModel(*responses), [self.tool]).run('recover then retry')
+        self.assertEqual((result.status, result.steps), ('completed', 16))
+
+    def test_stall_counters_reset_for_next_user_turn(self):
+        model = ScriptedModel(*(call(a=1, b=2) for _ in range(8)), call(a=1, b=2), final())
+        agent = Agent(model, [self.tool])
+        self.assertEqual(agent.run('first').status, 'stalled')
+        self.assertEqual(agent.run('try once more').status, 'completed')
+
+    def test_dynamic_tool_created_during_run_is_available_next_request(self):
+        saved = []
+        def create(a, b):
+            saved.append(Tool('generated_add', 'Created during run.', AddArgs,
+                              lambda a, b: a + b, read_only=True))
+            return {'created': 'generated_add'}
+        create_tool = Tool('create', 'Create a tool.', AddArgs, create, read_only=True)
+        model = ScriptedModel(call('create', a=0, b=0), call('generated_add', a=2, b=5), final('7'))
+        agent = Agent(model, [create_tool], dynamic_tools=lambda: list(saved))
+        result = agent.run('create and use')
+        self.assertEqual((result.status, result.answer), ('completed', '7'))
+        self.assertNotIn('generated_add', {t['name'] for t in model.definitions[0]})
+        self.assertIn('generated_add', {t['name'] for t in model.definitions[1]})
+        self.assertEqual(json.loads(model.calls[2][-1]['content'])['result'], 7)
+
+    def test_dynamic_refresh_replaces_and_removes_old_tools(self):
+        version1 = Tool('generated_add', 'Version 1.', AddArgs, lambda a, b: a + b, read_only=True)
+        version2 = Tool('generated_add', 'Version 2.', AddArgs, lambda a, b: a * b, read_only=True)
+        snapshots = iter([[version1], [version2], [], []])
+        model = ScriptedModel(call('generated_add', a=2, b=3), call('generated_add', a=2, b=3),
+                              call('generated_add', a=2, b=3), final())
+        result = Agent(model, [self.tool], dynamic_tools=lambda: next(snapshots)).run('refresh')
+        self.assertEqual(result.status, 'completed')
+        self.assertEqual(json.loads(model.calls[1][-1]['content'])['result'], 5)
+        self.assertEqual(json.loads(model.calls[2][-1]['content'])['result'], 6)
+        self.assertEqual(json.loads(model.calls[3][-1]['content'])['error']['code'], 'unknown_tool')
+        self.assertNotIn('generated_add', {t['name'] for t in model.definitions[2]})
+
+    def test_dynamic_tool_cannot_override_static_tool(self):
+        conflicting = Tool('add', 'Overrides built-in.', AddArgs, lambda a, b: -1, read_only=True)
+        model = ScriptedModel(final())
+        agent = Agent(model, [self.tool], dynamic_tools=lambda: [conflicting])
+        result = agent.run('protected registry')
+        self.assertEqual(result.status, 'model_error')
+        self.assertIs(agent.tools['add'], self.tool)
+        self.assertEqual(model.calls, [])
+
+    def test_stop_context_is_visible_during_tool_and_cleared_afterward(self):
+        self.assertTrue(hasattr(tool_runtime, 'execution_stopped'))
+        stop, observed = threading.Event(), []
+        def handler(a, b):
+            observed.append(tool_runtime.execution_stopped())
+            stop.set()
+            observed.append(tool_runtime.execution_stopped())
+            return a + b
+        tool = Tool('add', 'Stop-aware tool.', AddArgs, handler, read_only=True)
+        agent = Agent(ScriptedModel(call(a=1, b=2)), [tool])
+        self.assertEqual(agent.run('stop inside tool', should_stop=stop.is_set).status, 'cancelled')
+        self.assertEqual(observed, [False, True])
+        self.assertFalse(tool_runtime.execution_stopped())
+
+    def test_stop_context_restores_nested_state_after_exception(self):
+        self.assertTrue(hasattr(tool_runtime, 'tool_execution_context'))
+        with tool_runtime.tool_execution_context(lambda: True):
+            try:
+                with tool_runtime.tool_execution_context(lambda: False):
+                    self.assertFalse(tool_runtime.execution_stopped())
+                    raise ValueError('leave nested context')
+            except ValueError:
+                pass
+            self.assertTrue(tool_runtime.execution_stopped())
+        self.assertFalse(tool_runtime.execution_stopped())
 
 
 if __name__ == '__main__':

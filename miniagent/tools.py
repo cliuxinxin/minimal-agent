@@ -4,10 +4,30 @@ from __future__ import annotations
 
 import json
 import re
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Callable
 
 from pydantic import BaseModel, ConfigDict, ValidationError
+
+
+_STOP_CHECK: ContextVar[Callable[[], bool] | None] = ContextVar('tool_stop_check', default=None)
+
+
+def execution_stopped() -> bool:
+    """Let a running tool observe cancellation without sharing state across sessions."""
+    check = _STOP_CHECK.get()
+    return bool(check()) if check is not None else False
+
+
+@contextmanager
+def tool_execution_context(should_stop: Callable[[], bool]):
+    token = _STOP_CHECK.set(should_stop)
+    try:
+        yield
+    finally:
+        _STOP_CHECK.reset(token)
 
 
 class ToolArgs(BaseModel):

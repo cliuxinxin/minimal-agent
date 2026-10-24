@@ -78,6 +78,74 @@ class WebTests(unittest.TestCase):
         self.assertFalse((self.root / 'config.json').exists())
         self.assertEqual(self.request('POST', '/api/sessions', {})[0], 400)
 
+    def test_tool_inventory_and_extended_settings_over_http(self):
+        status, inventory = self.request('GET', '/api/tools')
+        self.assertEqual(status, 200)
+        self.assertEqual(inventory['saved_tools'], [])
+        self.assertNotIn('calculate', [item['name'] for item in inventory['tools']])
+        status, body = self.configure(max_steps=None, search_api_key='search-secret-not-for-browser')
+        self.assertEqual(status, 200, body)
+        self.assertIsNone(body['config']['max_steps'])
+        self.assertTrue(body['config']['has_search_api_key'])
+        self.assertNotIn('search-secret-not-for-browser', json.dumps(body))
+        inventory = self.request('GET', '/api/tools')[1]
+        self.assertIn('web_search', [item['name'] for item in inventory['tools']])
+        sid = self.session()
+        detail = self.request('GET', '/api/sessions/' + sid)[1]['session']
+        self.assertIsNone(detail['max_steps'])
+        self.assertTrue(detail['search_enabled'])
+
+    def test_create_and_use_python_tool_in_same_run_and_reload(self):
+        self.configure()
+        sid = self.session()
+        calls = []
+        def reply(name, arguments, call_id):
+            encoded = json.dumps(arguments)
+            message = {'role': 'assistant', 'content': None, 'tool_calls': [
+                {'id': call_id, 'type': 'function', 'function': {'name': name, 'arguments': encoded}}]}
+            return ModelReply('', [ToolCall(call_id, name, encoded)], message)
+        def complete(messages, tools, system_prompt):
+            names = [tool['name'] for tool in tools]
+            calls.append(names)
+            if len(calls) == 1:
+                return reply('create_tool', {
+                    'name': 'repeat_text', 'description': 'Repeat text a chosen number of times.',
+                    'code': 'def run(arguments):\n    return arguments["text"] * arguments["count"]\n',
+                    'example_arguments': {'text': 'hi', 'count': 2}, 'expected_result': 'hihi',
+                }, 'create')
+            if len(calls) == 2:
+                self.assertIn('repeat_text', names)
+                return reply('repeat_text', {'arguments': {'text': 'go', 'count': 3}}, 'invoke')
+            self.assertEqual(json.loads(messages[-1]['content'])['result'], 'gogogo')
+            return ModelReply('工具已保存并执行：gogogo', [], {'role': 'assistant', 'content': '工具已保存并执行：gogogo'})
+        with patch.object(OpenAIModel, 'complete', side_effect=complete):
+            self.request('POST', f'/api/sessions/{sid}/messages', {'message': '创建并运行文字重复工具'})
+            detail = self.wait_done(sid)
+        self.assertEqual(detail['run']['status'], 'completed', detail)
+        inventory = self.request('GET', '/api/tools')[1]
+        self.assertEqual(inventory['saved_tools'][0]['name'], 'repeat_text')
+        self.assertIn('def run(arguments)', inventory['saved_tools'][0]['code'])
+        from miniagent.config import load_agent
+        restarted = load_agent(self.root / 'config.json', workspace=self.root / 'workspace')
+        with patch.object(OpenAIModel, 'complete', return_value=ModelReply('ok', [], {'role': 'assistant', 'content': 'ok'})):
+            self.assertEqual(restarted.run('加载已保存工具').status, 'completed')
+        saved = restarted.tools['repeat_text']
+        self.assertEqual(saved.execute({'arguments': {'text': 'persist', 'count': 1}}, restarted.approve),
+                         {'ok': True, 'result': 'persist'})
+
+    def test_search_secret_is_redacted_from_errors_events_and_disk_trace(self):
+        secret = 'search-secret-not-for-browser'
+        self.configure(search_api_key=secret)
+        sid = self.session()
+        with patch.object(OpenAIModel, 'complete', side_effect=RuntimeError('upstream echoed ' + secret)):
+            self.request('POST', f'/api/sessions/{sid}/messages', {'message': '搜索'})
+            detail = self.wait_done(sid)
+        self.assertEqual(detail['run']['status'], 'error')
+        self.assertNotIn(secret, json.dumps(detail))
+        self.assertIn('[redacted]', detail['run']['error'])
+        for path in (self.root / 'runs').glob('*.jsonl'):
+            self.assertNotIn(secret, path.read_text())
+
     def test_real_agent_run_session_history_and_trace(self):
         self.configure()
         sid = self.session()

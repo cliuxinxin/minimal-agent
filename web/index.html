@@ -27,6 +27,8 @@
     <symbol id="i-trace" viewBox="0 0 24 24"><path d="M9 5h12M9 12h12M9 19h12"/><circle cx="3" cy="5" r="1"/><circle cx="3" cy="12" r="1"/><circle cx="3" cy="19" r="1"/></symbol>
     <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></symbol>
     <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="13" rx="2"/><path d="M15 8V3H3v13h5"/></symbol>
+    <symbol id="i-code" viewBox="0 0 24 24"><path d="m8 6-6 6 6 6m8-12 6 6-6 6m-3-15-2 18"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10" cy="10" r="7"/><path d="m15 15 6 6"/></symbol>
   </svg>
 
   <div class="app-shell">
@@ -41,7 +43,7 @@
     <main class="workspace">
       <header class="topbar">
         <div class="workspace-heading"><h1>工作台</h1><span class="breadcrumb-slash">/</span><span class="conversation-title" id="conversation-title">新对话</span></div>
-        <div class="header-actions"><button class="button quiet trace-toggle" id="open-trace" hidden><svg class="icon"><use href="#i-trace"/></svg><span>运行记录</span></button><button class="button quiet files-toggle" id="open-files"><svg class="icon"><use href="#i-folder"/></svg><span>工作文件</span><span class="count" id="file-count">0</span></button></div>
+        <div class="header-actions"><button class="button quiet trace-toggle" id="open-trace" hidden><svg class="icon"><use href="#i-trace"/></svg><span>运行记录</span></button><button class="button quiet tools-toggle" id="open-tools"><svg class="icon"><use href="#i-code"/></svg><span>工具</span></button><button class="button quiet files-toggle" id="open-files"><svg class="icon"><use href="#i-folder"/></svg><span>工作文件</span><span class="count" id="file-count">0</span></button></div>
       </header>
       <div class="model-line" id="model-line" hidden></div>
       <div class="connection-banner" id="connection-banner" role="alert" hidden></div>
@@ -49,8 +51,8 @@
       <section class="conversation" id="conversation" aria-label="对话内容">
         <div class="empty-state" id="empty-state">
           <h2>从一个任务开始。</h2>
-          <p>提问、读取文件，或让工具完成任务。</p>
-          <div class="prompt-shortcuts"><button class="button shortcut" id="summarize-file"><svg class="icon"><use href="#i-file"/></svg><span>总结一份文件</span></button><button class="button shortcut" id="analyze-question"><svg class="icon"><use href="#i-chart"/></svg><span>分析一个问题</span></button></div>
+          <p>读取文件、编写工具，或搜索最新资料。</p>
+          <div class="prompt-shortcuts"><button class="button shortcut" id="summarize-file"><svg class="icon"><use href="#i-file"/></svg><span>总结文件</span></button><button class="button shortcut" id="create-tool-prompt"><svg class="icon"><use href="#i-code"/></svg><span>创建工具</span></button><button class="button shortcut" id="search-web-prompt"><svg class="icon"><use href="#i-search"/></svg><span>搜索网页</span></button></div>
         </div>
         <div class="messages" id="messages" hidden></div>
       </section>
@@ -70,7 +72,8 @@
 
   <dialog class="settings-dialog" id="settings-dialog" aria-labelledby="settings-title">
     <form id="settings-form">
-      <div class="dialog-heading"><div><h2 id="settings-title">模型设置</h2><p>连接你使用的模型服务。</p></div><button class="icon-button" type="button" data-close="settings-dialog" aria-label="关闭模型设置"><svg class="icon"><use href="#i-close"/></svg></button></div>
+      <div class="dialog-heading"><div><h2 id="settings-title">模型设置</h2><p>连接模型，设置运行次数与联网搜索。</p></div><button class="icon-button" type="button" data-close="settings-dialog" aria-label="关闭模型设置"><svg class="icon"><use href="#i-close"/></svg></button></div>
+      <div class="settings-content">
       <label for="provider">服务商</label>
       <select id="provider" name="provider"><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option></select>
       <label for="model">模型名称</label>
@@ -81,7 +84,17 @@
       <label for="base-url">API 地址 <span class="optional">可选</span></label>
       <input id="base-url" name="base_url" type="url" autocomplete="off" placeholder="https://api.openai.com/v1">
       <p class="field-hint">留空使用服务商的官方地址。</p>
+      <div class="settings-section">
+        <label for="max-steps">每个任务的模型调用上限</label>
+        <select id="max-steps" name="max_steps"><option value="80">80 次</option><option value="800">800 次</option><option value="unlimited">不限制次数</option></select>
+        <p class="field-hint">随时可以停止；连续失败或重复执行无进展时会自动结束。</p>
+        <div class="field-heading"><label for="search-api-key">DeepSeek 搜索 API Key <span class="optional">可选</span></label><button class="text-button" type="button" id="clear-search-key" hidden>清除已保存的 Key</button></div>
+        <div class="password-field"><input id="search-api-key" name="search_api_key" type="password" autocomplete="new-password" placeholder="填写 DeepSeek API Key"><button type="button" class="icon-button" id="toggle-search-key" aria-label="显示搜索 API Key" aria-pressed="false"><svg class="icon"><use href="#i-eye"/></svg></button></div>
+        <p class="field-hint" id="search-key-hint">填入后启用网页搜索与正文读取，可配合任一模型使用。</p>
+      </div>
+      <p class="runtime-note">Python 以当前用户权限在本机运行，不是系统沙箱。单次运行最多 60 秒，输出最多 64 KiB。保存的新工具会在重启和更新后保留。</p>
       <p class="form-error" id="settings-error" role="alert" hidden></p>
+      </div>
       <div class="dialog-footer"><span>修改后从新对话开始生效。</span><button class="button primary" id="save-settings" type="submit">保存设置</button></div>
     </form>
   </dialog>
@@ -94,6 +107,16 @@
     <p class="form-error" id="files-error" role="alert" hidden></p>
     <div class="file-list" id="file-list"></div>
     <div class="drawer-footer">文件保存在本机 workspace 文件夹中。</div>
+  </dialog>
+
+  <dialog class="drawer tools-drawer" id="tools-dialog" aria-labelledby="tools-title">
+    <div class="dialog-heading"><div><h2 id="tools-title">工具</h2><p>让 Agent 编写代码，积累可重复使用的工具。</p></div><button class="icon-button" type="button" data-close="tools-dialog" aria-label="关闭工具"><svg class="icon"><use href="#i-close"/></svg></button></div>
+    <div class="tools-toolbar"><span id="tools-loading" role="status" hidden>正在加载工具…</span><button class="text-button" type="button" id="refresh-tools">刷新列表</button></div>
+    <p class="form-error" id="tools-error" role="alert" hidden></p>
+    <p class="form-error" id="tools-warning" role="status" hidden></p>
+    <section class="tool-section" aria-labelledby="builtin-tools-title"><h3 id="builtin-tools-title">内置能力</h3><div id="builtin-tools-list" class="tool-list"></div></section>
+    <section class="tool-section" aria-labelledby="saved-tools-title"><h3 id="saved-tools-title">已保存的工具 <span id="saved-tools-count" class="count">0</span></h3><div id="saved-tools-list" class="tool-list"></div></section>
+    <div class="drawer-footer">用对话描述需要的工具，Agent 会编写代码、运行测试并保存。工具保存在本机 local_tools 文件夹中。</div>
   </dialog>
 
   <dialog class="drawer trace-drawer" id="trace-dialog" aria-labelledby="trace-title">

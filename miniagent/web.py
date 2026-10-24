@@ -21,6 +21,8 @@ from pydantic import ValidationError
 from .builtin_tools import build_tools
 from .config import _Config, load_agent
 from .model import AnthropicModel, OpenAIModel
+from .programming import ProgrammingTools
+from .search import build_search_tools
 from .tracing import JsonlTrace
 
 
@@ -29,6 +31,8 @@ WINDOWS_DEVICES = {'CON', 'PRN', 'AUX', 'NUL'} | {
     f'{prefix}{number}' for prefix in ('COM', 'LPT') for number in range(1, 10)}
 ACTIVE = {'running', 'stopping'}
 UPLOAD_LIMIT = 2 * 1024 * 1024
+TRACE_EVENT_LIMIT = 100
+TRACE_PREVIEW_LIMIT = 4000
 
 
 class RequestError(Exception):
@@ -50,13 +54,34 @@ def unique_object(pairs):
 
 
 def redact(value, secret):
+    if isinstance(secret, (list, tuple)):
+        for item in secret:
+            value = redact(value, item)
+        return value
     if isinstance(value, str):
         return value.replace(secret, '[redacted]') if secret else value
     if isinstance(value, list):
         return [redact(item, secret) for item in value]
     if isinstance(value, dict):
-        return {key: redact(item, secret) for key, item in value.items()}
+        return {redact(key, secret) if isinstance(key, str) else key: redact(item, secret)
+                for key, item in value.items()}
     return value
+
+
+def browser_event(event):
+    """Bound the UI trace while preserving the complete event for disk logging."""
+    displayed = copy.deepcopy(event)
+    data = displayed.get('data', {})
+    for key in ('task', 'arguments', 'answer'):
+        if isinstance(data.get(key), str) and len(data[key]) > TRACE_PREVIEW_LIMIT:
+            data[key] = data[key][:TRACE_PREVIEW_LIMIT] + '\n…（完整内容见本机 runs 日志）'
+            data['truncated'] = True
+    if 'result' in data:
+        serialized = json.dumps(data['result'], ensure_ascii=False, allow_nan=False)
+        if len(serialized) > TRACE_PREVIEW_LIMIT:
+            data['result'] = {'truncated': True, 'preview': serialized[:TRACE_PREVIEW_LIMIT],
+                              'note': '仅显示预览；完整内容见本机 runs 日志。'}
+    return displayed
 
 
 class WebState:
@@ -91,13 +116,24 @@ class WebState:
                 'model': config.model if config else '',
                 'base_url': (config.base_url or '') if config else '',
                 'has_api_key': bool(config and config.api_key.get_secret_value().strip()),
+                'max_steps': config.max_steps if config else 80,
+                'has_search_api_key': bool(config and config.search_api_key and
+                                           config.search_api_key.get_secret_value().strip()),
                 'configured': valid}
 
     def save_config(self, data):
-        if set(data) - {'provider', 'model', 'api_key', 'base_url'}:
-            raise RequestError(400, '只支持 provider、model、api_key、base_url 四项配置。')
+        if set(data) - {'provider', 'model', 'api_key', 'base_url', 'max_steps', 'search_api_key'}:
+            raise RequestError(400, '配置中包含不支持的字段。')
         old = self.read_config()
         data = dict(data)
+        data.setdefault('max_steps', old.max_steps if old else 80)
+        old_search_key = old.search_api_key.get_secret_value() if old and old.search_api_key else None
+        if 'search_api_key' not in data or data['search_api_key'] == '':
+            data['search_api_key'] = old_search_key
+        elif data['search_api_key'] is not None:
+            if not isinstance(data['search_api_key'], str):
+                raise RequestError(400, 'DeepSeek 搜索 API Key 必须为文本。')
+            data['search_api_key'] = data['search_api_key'].strip() or old_search_key
         if isinstance(data.get('base_url'), str):
             data['base_url'] = data['base_url'].strip().rstrip('/') or None
         if 'api_key' in data and not isinstance(data['api_key'], str):
@@ -115,10 +151,13 @@ class WebState:
         try:
             config = _Config.model_validate(data)
             self.model(config)
+            if config.search_api_key:
+                build_search_tools(config.search_api_key.get_secret_value())
         except (ValidationError, ValueError):
-            raise RequestError(400, '配置无效，请检查服务商、模型、API Key 和 HTTP(S) 接口地址。') from None
-        stored = config.model_dump(exclude={'api_key'})
+            raise RequestError(400, '配置无效，请检查模型设置、密钥和调用次数上限。') from None
+        stored = config.model_dump(exclude={'api_key', 'search_api_key'})
         stored['api_key'] = config.api_key.get_secret_value()
+        stored['search_api_key'] = config.search_api_key.get_secret_value() if config.search_api_key else None
         descriptor, filename = tempfile.mkstemp(prefix='.config-', dir=self.root)
         try:
             with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
@@ -130,6 +169,16 @@ class WebState:
         finally:
             Path(filename).unlink(missing_ok=True)
         return self.masked_config()
+
+    def tool_inventory(self):
+        programming = ProgrammingTools(self.root, self.workspace)
+        tools = build_tools(self.workspace) + programming.builtin_tools()
+        config = self.read_config()
+        if config and config.search_api_key and config.search_api_key.get_secret_value().strip():
+            tools.extend(build_search_tools(config.search_api_key.get_secret_value()))
+        saved = programming.summaries()
+        return {'tools': [{'name': tool.name, 'description': tool.description} for tool in tools],
+                'saved_tools': saved, 'tool_errors': programming.errors()}
 
     def files(self):
         return [{'name': path.name, 'size': path.stat().st_size}
@@ -179,9 +228,13 @@ class WebState:
             raise RequestError(400, '请先保存有效的模型配置。') from None
         timestamp, sid = now(), uuid4().hex
         detail = {'id': sid, 'title': '新对话', 'provider': config.provider, 'model': config.model,
+                  'max_steps': config.max_steps, 'search_enabled': bool(config.search_api_key and
+                      config.search_api_key.get_secret_value().strip()),
                   'created_at': timestamp, 'updated_at': timestamp, 'messages': [], 'run': None}
         self.sessions[sid] = {'detail': detail, 'agent': agent,
-                              'secret': config.api_key.get_secret_value(), 'stop': None}
+                              'secret': [config.api_key.get_secret_value(),
+                                         config.search_api_key.get_secret_value() if config.search_api_key else ''],
+                              'stop': None}
         return detail
 
     def get_session(self, sid):
@@ -205,7 +258,8 @@ class WebState:
         detail = session['detail']
         if detail['run'] and detail['run']['status'] in ACTIVE:
             raise RequestError(409, '该对话仍在运行，请等待或停止。')
-        run = {'id': uuid4().hex, 'status': 'running', 'step': 0, 'error': None, 'events': []}
+        run = {'id': uuid4().hex, 'status': 'running', 'step': 0, 'error': None, 'events': [],
+               'event_count': 0, 'omitted_events': 0}
         session['stop'] = threading.Event()
         detail['run'] = run
         if not detail['messages']:
@@ -223,7 +277,12 @@ class WebState:
             trace(event)
             if event['event'] != 'model_output':
                 with self.lock:
-                    run['events'].append(event)
+                    run['events'].append(browser_event(event))
+                    run['event_count'] += 1
+                    excess = len(run['events']) - TRACE_EVENT_LIMIT
+                    if excess > 0:
+                        del run['events'][:excess]
+                        run['omitted_events'] += excess
                     run['step'] = event.get('step', run['step'])
         session['agent'].on_event = on_event
         try:
@@ -240,7 +299,7 @@ class WebState:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = 'MinimalAgent/0.2.0'
+    server_version = 'MinimalAgent/0.3.0'
 
     def log_message(self, *args):
         pass  # Do not log bodies, keys, or user messages.
@@ -324,14 +383,14 @@ class Handler(BaseHTTPRequestHandler):
             if path == '/favicon.ico':
                 return 204, b'', 'image/x-icon'
             if path == '/api/health':
-                result = {'app': 'minimal-agent-web', 'version': '0.2.0',
+                result = {'app': 'minimal-agent-web', 'version': '0.3.0',
                           'workspace_id': hashlib.sha256(str(state.root).encode()).hexdigest()[:12]}
             elif path in {'/api/bootstrap', '/api/config'}:
                 result = {'config': state.masked_config()}
                 if path == '/api/bootstrap':
-                    result.update(sessions=state.summaries(), files=state.files(),
-                                  tools=[{'name': tool.name, 'description': tool.description}
-                                         for tool in build_tools(state.workspace)])
+                    result.update(sessions=state.summaries(), files=state.files(), **state.tool_inventory())
+            elif path == '/api/tools':
+                result = state.tool_inventory()
             elif path == '/api/sessions':
                 result = {'sessions': state.summaries()}
             elif path == '/api/files':
