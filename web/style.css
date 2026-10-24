@@ -94,20 +94,6 @@ svg { flex-shrink: 0; }
 .message.assistant .message-label { display: flex; align-items: center; gap: 9px; font-size: 12px; font-weight: 600; margin-bottom: 10px; color: #62718a; }
 .mini-mark { color: #315fe9; width: 19px; height: 19px; fill: currentColor; stroke: none; }
 .message.assistant .message-content { font-size: 15px; line-height: 1.85; padding-left: 29px; }
-.message.assistant.error .message-content { color: var(--error); }
-.message.assistant.cancelled .message-content { color: #7b8494; }
-.markdown p { margin: 0 0 13px; }
-.markdown h2, .markdown h3, .markdown h4 { font-size: 18px; margin: 19px 0 9px; font-weight: 650; }
-.markdown ul, .markdown ol { padding-left: 24px; margin: 8px 0 15px; }
-.markdown li { margin: 4px 0; }
-.markdown a { color: var(--accent); text-underline-offset: 3px; }
-.markdown code { font: 13px/1.6 ui-monospace, SFMono-Regular, Consolas, monospace; background: #f0f3f8; border-radius: 4px; padding: 2px 5px; }
-.code-block { margin: 15px 0; border: 1px solid var(--border); border-radius: 9px; overflow: hidden; background: #f8f9fc; }
-.code-heading { display: flex; align-items: center; justify-content: space-between; padding: 7px 12px; color: #778299; font-size: 11px; border-bottom: 1px solid var(--border); }
-.copy-code { display: inline-flex; align-items: center; gap: 5px; border: 0; border-radius: 4px; padding: 2px 5px; font-size: 11px; background: transparent; color: #6f7d92; }
-.copy-code .icon { width: 13px; height: 13px; }
-.code-block pre { margin: 0; padding: 14px; overflow: auto; }
-.code-block code { background: none; padding: 0; font-size: 12px; white-space: pre; }
 .icon-button { width: 36px; height: 36px; padding: 7px; display: grid; place-items: center; border: 0; background: transparent; border-radius: 7px; flex-shrink: 0; color: #7c8798; }
 dialog { color: var(--text); font: 14px/1.6 var(--font); padding: 30px; border: 1px solid var(--border); border-radius: 16px; box-shadow: 0 24px 80px rgba(23,36,59,.15); max-height: calc(100dvh - 40px); background: white; }
 dialog::backdrop { background: rgba(20,33,57,.22); backdrop-filter: blur(2px); }

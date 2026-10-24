@@ -6,7 +6,8 @@
   <meta name="color-scheme" content="light">
   <title>Minimal Agent · 工作台</title>
   <link rel="stylesheet" href="/style.css">
-  <script src="/app.js" defer></script>
+  <link rel="stylesheet" href="/assets/chat.css">
+  <script src="/app.js" type="module"></script>
 </head>
 <body>
   <svg class="icon-definitions" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
@@ -54,7 +55,7 @@
           <p>读取文件、编写工具，或搜索最新资料。</p>
           <div class="prompt-shortcuts"><button class="button shortcut" id="summarize-file"><svg class="icon"><use href="#i-file"/></svg><span>总结文件</span></button><button class="button shortcut" id="create-tool-prompt"><svg class="icon"><use href="#i-code"/></svg><span>创建工具</span></button><button class="button shortcut" id="search-web-prompt"><svg class="icon"><use href="#i-search"/></svg><span>搜索网页</span></button></div>
         </div>
-        <div class="messages" id="messages" hidden></div>
+        <div class="messages chat-mount" id="messages" hidden></div>
       </section>
 
       <div class="composer-region">

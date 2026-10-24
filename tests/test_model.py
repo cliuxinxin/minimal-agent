@@ -59,6 +59,18 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(reply.text, "")
         self.assertEqual(reply.message, {"role": "assistant", "content": None, "tool_calls": calls})
 
+    def test_openai_preserves_returned_reasoning_for_later_tool_turns(self):
+        body = self.openai_body("done")
+        body["choices"][0]["message"]["reasoning_content"] = "Provider thinking"
+        reply, _, _ = self.complete(OpenAIModel("m", "k"), body)
+        self.assertEqual(reply.message.get("reasoning_content"), "Provider thinking")
+
+    def test_openai_rejects_malformed_reasoning_content(self):
+        body = self.openai_body("done")
+        body["choices"][0]["message"]["reasoning_content"] = {"invalid": "shape"}
+        with self.assertRaises(ModelError):
+            self.complete(OpenAIModel("m", "k"), body)
+
     def test_openai_tool_results_are_individual_tool_messages(self):
         self.assertEqual(OpenAIModel("m", "k").tool_messages(RESULTS), [
             {"role": "tool", "tool_call_id": "call_1", "content": json.dumps(RESULTS[0]["payload"], ensure_ascii=False)},

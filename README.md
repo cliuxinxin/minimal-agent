@@ -1,6 +1,6 @@
 # Minimal Agent
 
-一个能在桌面浏览器里聊天、编程、创建可复用工具、搜索网页、上传文本文件并查看执行过程的 Python Agent。核心循环很短，方便阅读和扩展；界面与命令行共用同一个 Agent。
+一个能在桌面浏览器里聊天、编程、创建可复用工具、搜索网页、上传文本文件并实时查看执行过程的 Python Agent。文字、模型提供的思考内容和工具执行过程通过 SSE 出现在对话中。核心循环保持明确，方便阅读和扩展；界面与命令行共用同一个 Agent。
 
 支持标准 **OpenAI Chat Completions** 和 **Anthropic Messages**，使用各自原生的 `tool_calls` / `tool_use`。应用调用你配置的真实 API；没有离线演示模式。
 
@@ -15,7 +15,7 @@
 
 启动窗口会保持打开，为网页提供本地服务；关闭它会停止服务。浏览器默认地址为 `http://127.0.0.1:8765`，端口被占用时会自动选择其他端口并打开正确地址。macOS 如果首次阻止打开脚本，可在 Finder 里右键文件，选择“打开”。
 
-运行环境只有 Python 和 Pydantic；前端使用原生 HTML、CSS、JavaScript，无须安装 Node.js。
+运行环境只有 Python 和 Pydantic；对话界面使用成熟的 **assistant-ui** React 组件，构建好的前端文件随项目提供。正常使用无须安装 Node.js、运行前端构建或连接在线 CDN。
 
 后续更新时，关闭启动窗口、同步 GitHub 的最新代码，再双击启动即可。`.gitignore` 会排除本机配置、虚拟环境、运行日志、新增的上传文件和 `local_tools/` 中生成的工具；仓库仅保留两份随项目提供的示例文本。
 
@@ -23,11 +23,15 @@
 
 - **聊天与新建对话**：同一对话保留上下文，可以在侧栏切换会话。
 - **上传文件**：支持 UTF-8 编码的 `.txt`、`.md`、`.json`、`.csv`，每个最多 2 MiB。文件保存在项目的 `workspace/`，同名文件自动改名。
-- **查看执行过程**：查看模型调用阶段、工具名称、参数和返回结果。网页保留最近 100 条事件并限制单条预览长度，完整记录保存在本机 `runs/`，避免长任务拖慢界面。
+- **实时对话**：模型开启原生流式输出，本地服务通过 SSE 推送到页面。回答逐步显示；工具准备、执行和结果按顺序出现在同一条对话中，不必打开记录抽屉。
+- **思考内容**：接口实际返回的公开思考内容或摘要显示在可展开区域。兼容 OpenAI 格式的 `reasoning_content` 和 Anthropic 的 `thinking_delta`；没有返回内容时只显示运行状态，不生成假的思考过程。签名和加密思考块不会发送到页面。
+- **Markdown**：支持标题、粗体、引用、嵌套列表、表格、任务列表、删除线、代码高亮与复制。流式过程中会处理尚未闭合的格式，完成后按原文渲染。
+- **查看执行过程**：对话保留最近 80 个文字、思考或工具片段，长文字片段显示截断提示；记录抽屉保留最近 100 条阶段事件。完整运行事件保存在本机 `runs/`。
 - **编程**：`run_python` 在本机 Python 子进程中运行代码，可读取工作文件、生成结果、执行计算和处理文本。原来的 Calculator 已移除。
 - **创建工具**：`create_tool` 运行样例测试，结果与预期相符才保存。下一次模型请求就能使用新工具；新对话和重启后也能使用。点击网页“工具”可查看已保存的代码和样例。
 - **联网搜索**：`web_search` 搜索网页并返回真实来源链接；`fetch_webpage` 获取网页正文并支持分段读取。填入 DeepSeek 搜索 Key 后启用。
-- **停止运行**：停止后不再发起下一次模型或工具调用；正在执行的 Python 子进程会被终止。模型请求的网络超时为 60 秒，搜索请求为 30 秒；这些正在进行的网络请求仍需等到返回或超时。
+- **停止运行**：停止后中断正在读取的模型流和 Python 子进程，不再发起下一次模型或工具调用；已显示的内容保留并标记停止。搜索请求和一般同步工具仍需等待返回或超时；搜索超时为 30 秒。
+- **断线恢复**：页面与服务之间短暂断开时自动重连，补齐事件或恢复当前快照，不会重新执行任务。关闭网页不会停止后台任务；需要停止时点击停止按钮。
 - **任务上限**：默认 80 次模型请求，网页可选择 800 次或“不限制次数”。连续 8 轮工具全部失败，或连续 8 轮调用参数和结果完全相同，程序会停止并说明原因。
 - **模型设置**：保留服务商、模型、API Key、可选接口地址，新增调用次数上限和可选搜索 Key。保存设置后新建对话使用新配置；已有对话保留创建时的配置。
 
@@ -62,14 +66,27 @@ DeepSeek 搜索使用 `POST https://api.deepseek.com/v1/tools/search`，正文�
 
 对话保存在本地服务的内存中：刷新网页会保留，关闭服务会清空。配置、上传文件和 `runs/*.jsonl` 执行日志保存在磁盘中；日志用于检查运行过程，不会自动恢复会话。日志可能含任务、文件和工具结果，请按原始业务数据管理。
 
+## 流式输出与思考显示
+
+网页默认使用流式接口，无需增加配置。OpenAI 适配器使用 `POST /chat/completions` 的 `stream=true`；Anthropic 适配器使用 `POST /v1/messages` 的 `stream=true`。工具参数在完整、有效的回复结束后才执行，未完成的参数不会触发工具。
+
+思考内容取决于模型和接口能力。标准 OpenAI Chat Completions 没有通用的可见推理摘要字段；OpenAI 的推理摘要属于 Responses API，需要显式请求，本项目继续使用 Chat Completions。Anthropic 只有在接口实际返回可见 `thinking_delta` 时才展示。不同 Claude 版本的思考参数并不通用，本项目不会自动注入模型可能不支持的参数。使用 DeepSeek 等兼容接口时，如果服务返回 `reasoning_content`，会实时显示并按原生协议保留在后续上下文中。
+
+参考：[OpenAI reasoning summaries](https://developers.openai.com/api/docs/guides/reasoning#reasoning-summaries)、[Anthropic streaming](https://platform.claude.com/docs/en/build-with-claude/streaming)、[DeepSeek thinking mode](https://api-docs.deepseek.com/guides/thinking_mode/)。
+
+对话显示直接使用 [assistant-ui](https://www.assistant-ui.com/) 的组件与 Markdown 渲染方案。`ExternalStoreRuntime` 负责把现有 Python/SSE 会话接入组件；消息列表、自动滚动、思考区域和工具调用沿用库的能力。源码、固定依赖与组件来源在 `frontend/`，已构建的浏览器文件在 `web/assets/`。Markdown 不执行模型返回的 HTML，危险链接不会成为可点击地址，外部图片不会自动加载。
+
+运行中的长内容保持有界预览，截断时显示说明；完成后保留完整最终答案，必要时可展开原文并复制完整回复。开发者修改对话组件和重新构建的方法见 [前端开发说明](frontend/README.md)。
+
 ## 读懂并扩展
 
 | 文件 | 职责 |
 | --- | --- |
-| `web/index.html`、`web/style.css`、`web/app.js` | 浏览器界面、样式与交互 |
-| `miniagent/web.py` | 本地 HTTP 接口、会话、上传、后台运行和日志 |
+| `web/index.html`、`web/style.css`、`web/app.js` | 桌面界面、设置、SSE 会话状态 |
+| `frontend/`、`web/assets/` | assistant-ui 源码、依赖锁定与已构建的对话组件 |
+| `miniagent/web.py` | 本地 HTTP/SSE 接口、会话、上传、后台运行和日志 |
 | `miniagent/agent.py` | 模型调用 → 工具选择 → 验证和审批 → 执行 → 回传结果 |
-| `miniagent/model.py` | 两家服务的原生工具调用适配器 |
+| `miniagent/model.py`、`miniagent/sse.py` | 两家服务的原生流式适配器与有界 SSE 传输 |
 | `miniagent/tools.py` | `ToolArgs` 严格参数验证和 `Tool` 执行边界 |
 | `miniagent/builtin_tools.py` | `list_files`、`read_file` |
 | `miniagent/programming.py`、`miniagent/python_worker.py` | Python 子进程、样例测试、工具保存与动态加载 |
@@ -101,6 +118,6 @@ python -m examples.custom_tool '查询 REQ-001 的要求'
 python -m unittest discover -s tests -v
 ```
 
-自动化测试包含真实 Python 子进程、工具保存与重载、超时和停止、长循环、密钥保留与脱敏，以及搜索接口契约。测试替身仅出现在测试代码中。交付未使用你的服务与凭据进行真实 API 联调；首次使用请核对配置、工具轨迹和最终结果。
+自动化测试包含真实 Python 子进程、本机 HTTP 流式传输、提前送达、停止、SSE 重连、分片密钥脱敏、工具保存与重载、长循环，以及搜索接口契约。测试替身仅出现在测试代码中。交付未使用你的服务与凭据进行真实 API 联调；首次使用请核对配置、工具轨迹和最终结果。
 
 学习对照：[CS329Z HW1](https://github.com/cs329z/assignment1-harness)、[Lecture 5：编排](https://web.stanford.edu/class/cs329z/slides/lecture05.pdf)、[Lecture 6：Agent 模式](https://web.stanford.edu/class/cs329z/slides/lecture06.pdf)。本项目为独立入门实现，没有复制课程作业代码。

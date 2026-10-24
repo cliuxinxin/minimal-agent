@@ -104,7 +104,7 @@ class WebTests(unittest.TestCase):
             message = {'role': 'assistant', 'content': None, 'tool_calls': [
                 {'id': call_id, 'type': 'function', 'function': {'name': name, 'arguments': encoded}}]}
             return ModelReply('', [ToolCall(call_id, name, encoded)], message)
-        def complete(messages, tools, system_prompt):
+        def complete(messages, tools, system_prompt, **stream_options):
             names = [tool['name'] for tool in tools]
             calls.append(names)
             if len(calls) == 1:
@@ -118,7 +118,7 @@ class WebTests(unittest.TestCase):
                 return reply('repeat_text', {'arguments': {'text': 'go', 'count': 3}}, 'invoke')
             self.assertEqual(json.loads(messages[-1]['content'])['result'], 'gogogo')
             return ModelReply('工具已保存并执行：gogogo', [], {'role': 'assistant', 'content': '工具已保存并执行：gogogo'})
-        with patch.object(OpenAIModel, 'complete', side_effect=complete):
+        with patch.object(OpenAIModel, 'stream', side_effect=complete):
             self.request('POST', f'/api/sessions/{sid}/messages', {'message': '创建并运行文字重复工具'})
             detail = self.wait_done(sid)
         self.assertEqual(detail['run']['status'], 'completed', detail)
@@ -137,7 +137,7 @@ class WebTests(unittest.TestCase):
         secret = 'search-secret-not-for-browser'
         self.configure(search_api_key=secret)
         sid = self.session()
-        with patch.object(OpenAIModel, 'complete', side_effect=RuntimeError('upstream echoed ' + secret)):
+        with patch.object(OpenAIModel, 'stream', side_effect=RuntimeError('upstream echoed ' + secret)):
             self.request('POST', f'/api/sessions/{sid}/messages', {'message': '搜索'})
             detail = self.wait_done(sid)
         self.assertEqual(detail['run']['status'], 'error')
@@ -150,7 +150,7 @@ class WebTests(unittest.TestCase):
         self.configure()
         sid = self.session()
         reply = ModelReply('模型回答', [], {'role': 'assistant', 'content': '模型回答', 'thinking': 'private'})
-        with patch.object(OpenAIModel, 'complete', return_value=reply):
+        with patch.object(OpenAIModel, 'stream', return_value=reply):
             self.assertEqual(self.request('POST', f'/api/sessions/{sid}/messages', {'message': '用户问题'})[0], 202)
             detail = self.wait_done(sid)
         self.assertEqual([m['content'] for m in detail['messages']], ['用户问题', '模型回答'])
@@ -166,11 +166,11 @@ class WebTests(unittest.TestCase):
         self.configure()
         sid = self.session()
         entered, release = threading.Event(), threading.Event()
-        def complete(*args):
+        def complete(*args, **stream_options):
             entered.set()
             release.wait(4)
             return ModelReply('late answer', [], {'role': 'assistant', 'content': 'late answer'})
-        with patch.object(OpenAIModel, 'complete', side_effect=complete):
+        with patch.object(OpenAIModel, 'stream', side_effect=complete):
             status, body = self.request('POST', f'/api/sessions/{sid}/messages', {'message': 'hello'})
             self.assertEqual(status, 202)
             self.assertTrue(entered.wait(2))
@@ -232,7 +232,7 @@ class WebTests(unittest.TestCase):
         call = ToolCall('read-1', 'read_file', '{"path":"facts.txt"}')
         replies = [ModelReply('', [call], {'role': 'assistant', 'content': ''}),
                    ModelReply('read successfully', [], {'role': 'assistant', 'content': 'read successfully'})]
-        with patch.object(OpenAIModel, 'complete', side_effect=replies):
+        with patch.object(OpenAIModel, 'stream', side_effect=replies):
             self.request('POST', f'/api/sessions/{sid}/messages', {'message': 'Read facts.txt'})
             detail = self.wait_done(sid)
         result = next(e for e in detail['run']['events'] if e['event'] == 'tool_result')

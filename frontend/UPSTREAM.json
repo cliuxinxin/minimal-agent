@@ -1,0 +1,54 @@
+{
+  "repository": "https://github.com/assistant-ui/assistant-ui",
+  "commit": "1fbf00dd0388fee912af95401876a6cc3c232b2c",
+  "files": [
+    "packages/ui/src/components/react/assistant-ui/elements/markdown-text.tsx",
+    "packages/ui/src/components/react/assistant-ui/elements/reasoning.aui.tsx",
+    "packages/ui/src/components/react/assistant-ui/elements/reasoning.tsx",
+    "packages/ui/src/components/react/assistant-ui/elements/tool-fallback.aui.tsx",
+    "packages/ui/src/components/react/assistant-ui/elements/tooltip-icon-button.tsx",
+    "packages/ui/src/components/react/assistant-ui/elements/collapsible-root.tsx",
+    "packages/ui/src/components/react/assistant-ui/utils/useIsomorphicLayoutEffect.ts",
+    "packages/ui/src/hooks/use-copy-to-clipboard.ts",
+    "packages/ui/src/lib/utils.ts",
+    "packages/ui/src/components/react/ui/base/textarea.tsx",
+    "packages/ui/src/components/react/assistant-ui/elements/thread.aui.tsx",
+    "packages/ui/src/components/react/assistant-ui/elements/syntax-highlighter.tsx",
+    "packages/ui/src/components/react/ui/base/button.tsx",
+    "packages/ui/src/components/react/ui/base/tooltip.tsx"
+  ],
+  "notes": [
+    "Generic ui imports resolve to ui/radix variants except skeleton and textarea in ui/base.",
+    "Upstream lib/utils.ts re-exports cn from the cn package; a conventional clsx/tailwind-merge cn utility can replace that project-specific alias."
+  ],
+  "source_sha256": {
+    "packages/ui/src/components/react/assistant-ui/elements/markdown-text.tsx": "7d20bd8fe709a1a6aeee24ba82531309e374740ba6181e092592275ffd6ff8ac",
+    "packages/ui/src/components/react/assistant-ui/elements/reasoning.aui.tsx": "3ae8bcf0d84fcb9ac37a40c2046abbf46d7b8f3967b482eec84f0a743aefce65",
+    "packages/ui/src/components/react/assistant-ui/elements/reasoning.tsx": "02c42a1cad5fd56f4479fe65c779e9f9934c03a6e935ac92ebf98cbb46ef3cc7",
+    "packages/ui/src/components/react/assistant-ui/elements/tool-fallback.aui.tsx": "31720ad79fe332a5999cc1873108da740e63c05f4b8f322bde75f8d495cbf853",
+    "packages/ui/src/components/react/assistant-ui/elements/tooltip-icon-button.tsx": "98580531a6f5a213cccd6964c0c75fd097d97b77bcca05f904df562512273363",
+    "packages/ui/src/components/react/assistant-ui/elements/collapsible-root.tsx": "6d3e6d9a776ac9db13448606627c2ef51e5605cacb2f805379ada9b58abe4565",
+    "packages/ui/src/components/react/assistant-ui/utils/useIsomorphicLayoutEffect.ts": "8db117d730e640655e5099e086af4e00d545c283839d9ef5885ca93419d51893",
+    "packages/ui/src/hooks/use-copy-to-clipboard.ts": "1f3b8a1bab79cef961f62eb25d6b58a0d16c957d63ba1faf086ad09c99712c0a",
+    "packages/ui/src/lib/utils.ts": "55bbdc94cef3e0c8a8bba386e94f97228dd2c967fe61466fc565378890550c08",
+    "packages/ui/src/components/react/ui/base/textarea.tsx": "abab274474743d7b6d30e67848e4341c2fbd491a8a300010e5da1176c7f9624f",
+    "packages/ui/src/components/react/assistant-ui/elements/thread.aui.tsx": "e25d1add530909469e6150d8e47ee9ea515037b518b0716a74655816b0c44575",
+    "packages/ui/src/components/react/assistant-ui/elements/syntax-highlighter.tsx": "1252faca7cf041675e264f3239fcc30c7ffc9f8e6c2b3a761630ca1b2be7d99f",
+    "packages/ui/src/components/react/ui/base/button.tsx": "de5e06ef482e702cc56abe8fbe0b1dfcfee9c30db4eafad24a38b5360188c42f",
+    "packages/ui/src/components/react/ui/base/tooltip.tsx": "43cf8405ec5856165c2e7543d9e07c7bdf186c0b9f39270141a42de3dc11d0cc"
+  },
+  "additional_source": {
+    "package": "@assistant-ui/react-syntax-highlighter",
+    "version": "0.14.7",
+    "path": "src/make-syntax-highlighter.tsx",
+    "local_path": "src/components/assistant-ui/elements/make-syntax-highlighter.tsx",
+    "license": "MIT"
+  },
+  "modifications": [
+    "Thread is adapted from the official Thread element to retain the local app composer and expose only supported text, reasoning, and server-owned tool parts. Official runtime, message grouping, viewport, actions, and disclosure behavior are retained.",
+    "Chinese labels and existing desktop styling are applied to the official elements.",
+    "MarkdownText disables synthetic smooth reveal, repairs only active display text with Remend, restricts clickable URLs to HTTP(S), and renders image references as text.",
+    "SyntaxHighlighter uses the official PrismLight adapter with directly imported common languages so no language module or asset is fetched at runtime.",
+    "The cn workspace helper is replaced with its standard clsx and tailwind-merge implementation."
+  ]
+}

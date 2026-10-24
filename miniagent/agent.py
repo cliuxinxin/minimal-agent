@@ -55,6 +55,27 @@ def _bounded_result(payload: dict) -> dict:
             'note': 'Result too long. Request a smaller segment if needed.'}
 
 
+def _public_reply_deltas(reply):
+    """Expose only text fields from a nonstream adapter's completed reply."""
+    message = reply.message
+    reasoning = message.get('reasoning_content')
+    if isinstance(reasoning, str) and reasoning:
+        yield {'type': 'reasoning_delta', 'text': reasoning}
+    content = message.get('content')
+    emitted_text = False
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get('type') == 'thinking' and isinstance(block.get('thinking'), str):
+                yield {'type': 'reasoning_delta', 'text': block['thinking']}
+            elif block.get('type') == 'text' and isinstance(block.get('text'), str):
+                emitted_text = True
+                yield {'type': 'text_delta', 'text': block['text']}
+    if not emitted_text and reply.text:
+        yield {'type': 'text_delta', 'text': reply.text}
+
+
 @dataclass(frozen=True)
 class RunResult:
     status: Literal['completed', 'step_limit', 'model_error', 'cancelled', 'stalled']
@@ -68,7 +89,8 @@ class Agent:
     def __init__(self, model: ChatModel, tools=(), *, system_prompt: str = '',
                  max_steps: int | None = 80, on_event: Callable | None = None,
                  approve: Callable | None = None,
-                 dynamic_tools: Callable[[], list[Tool]] | None = None):
+                 dynamic_tools: Callable[[], list[Tool]] | None = None,
+                 stream: bool = False):
         if max_steps is not None and (type(max_steps) is not int or max_steps < 1):
             raise ValueError('max_steps must be a positive integer or None.')
         if dynamic_tools is not None and not callable(dynamic_tools):
@@ -77,6 +99,7 @@ class Agent:
         self.system_prompt = system_prompt or SYSTEM_PROMPT
         self.max_steps, self.on_event, self.approve = max_steps, on_event, approve
         self.dynamic_tools = dynamic_tools
+        self.stream = stream
         self._dynamic_names: set[str] = set()
         self.tools: dict[str, Tool] = {}
         self.history: list[dict] = []
@@ -124,6 +147,23 @@ class Agent:
             emit('run_end', **asdict(result))
             return result
 
+        def on_delta(delta):
+            # Provider-native state belongs in history, never in public deltas.
+            if not isinstance(delta, dict):
+                return
+            event = delta.get('type')
+            if event in ('text_delta', 'reasoning_delta'):
+                if isinstance(delta.get('text'), str) and delta['text']:
+                    emit(event, text=delta['text'])
+            elif event == 'tool_call_delta':
+                if type(delta.get('index')) is not int or delta['index'] < 0:
+                    return
+                if not all(isinstance(delta.get(key, ''), str)
+                           for key in ('id', 'name', 'arguments_delta')):
+                    return
+                emit(event, index=delta['index'], id=delta.get('id', ''),
+                     name=delta.get('name', ''), arguments_delta=delta.get('arguments_delta', ''))
+
         self.history.append({'role': 'user', 'content': task})
         emit('run_start', task=task)
         while self.max_steps is None or steps < self.max_steps:
@@ -141,13 +181,23 @@ class Agent:
             if stopping():
                 return finish('cancelled')
             try:
-                reply = self.model.complete(copy.deepcopy(self.history), definitions, self.system_prompt)
+                messages = copy.deepcopy(self.history)
+                stream_reply = getattr(self.model, 'stream', None)
+                if self.stream and callable(stream_reply):
+                    reply = stream_reply(messages, definitions, self.system_prompt,
+                                         on_delta=on_delta, should_stop=stopping)
+                else:
+                    reply = self.model.complete(messages, definitions, self.system_prompt)
+                    if self.stream:
+                        for delta in _public_reply_deltas(reply):
+                            on_delta(delta)
             except Exception as error:
                 if stopping():
                     return finish('cancelled')
                 return finish('model_error', error=str(error)[:1000])
             self.history.append(reply.message)
             emit('model_output', message=reply.message)
+            emit('model_complete', text=reply.text, has_tool_calls=bool(reply.tool_calls))
             if not reply.tool_calls:
                 if stopping():
                     return finish('cancelled')

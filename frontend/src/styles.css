@@ -1,0 +1,79 @@
+@import "tailwindcss/theme.css" layer(theme);
+@import "tailwindcss/utilities.css" layer(utilities);
+@import "tw-animate-css";
+@source "./**/*.{ts,tsx}";
+
+@theme inline {
+  --color-background: #ffffff;
+  --color-foreground: #17243b;
+  --color-muted: #f3f6fa;
+  --color-muted-foreground: #7d899d;
+  --color-primary: #315fe9;
+  --color-primary-foreground: #ffffff;
+  --color-border: #e5e9f0;
+  --color-ring: #b7c8f7;
+  --color-destructive: #b33d45;
+  --color-secondary: #eef2f8;
+  --color-secondary-foreground: #536781;
+  --color-accent: #eef2fb;
+  --color-accent-foreground: #314c81;
+  --color-popover: #ffffff;
+  --color-popover-foreground: #17243b;
+  --font-sans: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+}
+
+/* Only the embedded conversation is styled here; the existing app shell stays vanilla. */
+.conversation.has-messages { padding: 0; overflow: hidden; }
+.messages.chat-mount { margin: 0; padding: 0; max-width: none; flex: 1; min-height: 0; height: 100%; }
+.chat-ui { height: 100%; min-height: 0; position: relative; font-family: var(--font); color: var(--text); }
+.model-line { position: static; flex-shrink: 0; max-width: none; margin: 0; padding: 7px 30px; min-height: 30px; line-height: 16px; background: white; }
+.aui-thread-viewport { height: 100%; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; padding: 24px 40px 22px; }
+.aui-message-list { width: 100%; max-width: 944px; margin: 0 auto; }
+.aui-thread-scroll-to-bottom { position: absolute; bottom: 12px; left: 50%; width: 34px; height: 34px; border-radius: 50%; background: white; border: 1px solid #e0e6ef; box-shadow: 0 3px 12px #263a5312; }
+.aui-thread-scroll-to-bottom:disabled { visibility: hidden; }
+.message-status { margin-left: 3px; display: inline-flex; align-items: center; gap: 5px; font-size: 10px; font-weight: 400; color: #98a2b1; }
+.message-status[data-status="running"], .message-status[data-status="stopping"] { color: #6e7fa1; }
+.message-status[data-status="running"]::before, .message-status[data-status="stopping"]::before { content: ""; width: 5px; height: 5px; background: #4a72da; border-radius: 50%; animation: pulse 1.5s ease-in-out infinite; }
+.message-waiting { display: flex; align-items: center; gap: 9px; color: #8b95a5; font-size: 13px; padding: 7px 0 10px; }
+.message-waiting::before { content: ""; height: 6px; width: 6px; background: #8ca4da; border-radius: 50%; animation: pulse 1.5s ease-in-out infinite; }
+.message-outcome { margin: 13px 0 0; padding: 10px 13px; border-left: 2px solid #b6c2d5; background: #f6f8fb; color: #748096; font-size: 12px; line-height: 1.75; }
+.message.error .message-outcome, .aui-message-error-root { background: #fff7f6; border-color: #de9b9a; color: #a35959; }
+.aui-message-error-root { margin-top: 8px; padding: 8px 12px; border-radius: 6px; font-size: 12px; }
+.segment-note { margin: 7px 0 11px; color: #8d97a7; font-size: 11px; line-height: 1.7; }
+.text-segment { margin-bottom: 16px; }
+.text-segment:last-child { margin-bottom: 0; }
+.reasoning-segment { margin: 2px 0 17px; border-left: 2px solid #e2e9f5; padding-left: 12px; }
+.reasoning-segment .aui-md { font-size: 13px; line-height: 1.9; color: #7a879a; }
+.aui-reasoning-trigger { font-size: 12px; }
+.aui-reasoning-trigger, .aui-tool-fallback-trigger { border: 0; background: transparent; padding-left: 0; text-align: left; }
+.aui-reasoning-trigger:hover, .aui-tool-fallback-trigger:hover { background: transparent !important; }
+.inline-tool { margin: 9px 0 16px; border: 1px solid #e5eaf2; border-radius: 8px; padding: 3px 12px; background: #fafbfd; }
+.aui-tool-fallback-trigger { width: 100%; font-size: 12px; min-height: 34px; }
+.aui-tool-fallback-trigger-label-wrapper { flex: 1; }
+.aui-tool-fallback-trigger-label-wrapper b { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-weight: 500; }
+.inline-tool[data-status="running"] .aui-tool-fallback-trigger, .inline-tool[data-status="preparing"] .aui-tool-fallback-trigger { color: #6380ba; }
+.inline-tool[data-status="completed"] .aui-tool-fallback-trigger-icon { color: #5b947c; }
+.inline-tool[data-status="error"] .aui-tool-fallback-trigger-icon { color: #bd7672; }
+.aui-tool-fallback-args-value, .aui-tool-fallback-result-content { max-height: 260px; overflow: auto; font: 11px/1.75 ui-monospace, SFMono-Regular, Consolas, monospace; }
+.aui-assistant-action-bar { display: flex; gap: 5px; margin-top: 8px; color: #93a0b2; }
+.aui-md { overflow-wrap: anywhere; line-height: 1.9; font-size: 15px; }
+.aui-md pre { white-space: pre; margin-top: 0; }
+.aui-md code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+.aui-md pre code { font-size: 12px; }
+.aui-md ul, .aui-md ol { padding-left: 0; }
+.aui-md li > p { margin-top: 5px; margin-bottom: 5px; }
+.aui-md input[type="checkbox"] { accent-color: #6688d8; margin-right: 6px; }
+.aui-md-table-wrapper { border-radius: 8px; border: 1px solid #e5e9f0; }
+.aui-md-table { font-size: 13px; line-height: 1.75; }
+.aui-md-table th, .aui-md-table td { min-width: 90px; }
+.aui-code-header-root { font-size: 11px; }
+.aui-button-icon { background: transparent; border: 0; color: #8b97a9; }
+.aui-button-icon svg { width: 15px; height: 15px; }
+.image-reference { color: #8a96a8; font-size: 12px; }
+[data-slot="tooltip-content"] { font: 11px/1.6 var(--font); }
+@media (max-width: 1100px) { .aui-thread-viewport { padding-left: 30px; padding-right: 30px; } }
+@media (prefers-reduced-motion: reduce) { .chat-ui *, .chat-ui *::before, .chat-ui *::after { animation: none !important; transition: none !important; } }
+
+.full-answer-disclosure { margin: 12px 0; padding: 10px 12px; background: #f6f8fc; border: 1px solid #e5eaf2; border-radius: 7px; font-size: 12px; }
+.full-answer-disclosure button { border: 0; background: transparent; color: #526eac; padding: 3px 0; font-size: 12px; }
+.full-answer-disclosure pre { max-height: 380px; overflow: auto; white-space: pre-wrap; font: 12px/1.8 ui-monospace, monospace; }

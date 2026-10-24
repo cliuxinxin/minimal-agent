@@ -23,7 +23,7 @@ class _Config(BaseModel):
 
 
 def load_agent(path: str | Path = 'config.json', *, on_event=None, approve=None,
-               workspace: str | Path = 'workspace') -> Agent:
+               workspace: str | Path = 'workspace', stream: bool = False) -> Agent:
     path = Path(path)
     if not path.is_file():
         raise ValueError('请复制 config.example.json 为 config.json，并填写模型和 API Key。')
@@ -45,4 +45,4 @@ def load_agent(path: str | Path = 'config.json', *, on_event=None, approve=None,
         tools.extend(build_search_tools(config.search_api_key.get_secret_value()))
     return Agent(model, tools, max_steps=config.max_steps, on_event=on_event,
                  approve=programming.approve if approve is None else approve,
-                 dynamic_tools=programming.load_tools)
+                 dynamic_tools=programming.load_tools, stream=stream)

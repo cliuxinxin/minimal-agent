@@ -1,3 +1,5 @@
+import { mountConversation, stopCurrentRun } from "./assets/chat.js";
+
 "use strict";
 
 // The browser only talks to the local host; provider credentials stay in its config.
@@ -6,8 +8,8 @@ const state = {
   config: { provider: "openai", model: "", base_url: "", has_api_key: false, configured: false,
     max_steps: 80, has_search_api_key: false },
   sessions: [], files: [], session: null, attachments: [], drafts: new Map(),
-  revision: 0, poll: null, sending: false, uploading: false, selecting: false, initialized: false,
-  messagesSignature: "", traceSignature: "", toastTimer: null,
+  revision: 0, stream: null, streamSerial: 0, streamSequence: 0, renderTimer: null, renderFull: false, sending: false, uploading: false, selecting: false, initialized: false,
+  chat: null, traceSignature: "", toastTimer: null,
   toolInventory: { tools: [], saved_tools: [], tool_errors: [] },
   toolsRequest: 0, toolsRun: null, searchKeyRemoved: false,
 };
@@ -248,102 +250,23 @@ async function openTools() {
   await refreshTools();
 }
 
-// A deliberately small Markdown renderer. External text never becomes HTML.
-function inlineText(element, text) {
-  const pattern = /(`[^`\n]+`|\*\*[^*\n]+\*\*|\[[^\]\n]+\]\(https?:\/\/[^\s)]+\))/g;
-  let position = 0;
-  for (const match of text.matchAll(pattern)) {
-    element.append(document.createTextNode(text.slice(position, match.index)));
-    const value = match[0];
-    if (value.startsWith("`")) element.append(node("code", "", value.slice(1, -1)));
-    else if (value.startsWith("**")) element.append(node("strong", "", value.slice(2, -2)));
-    else {
-      const parts = /^\[([^\]]+)\]\(([^)]+)\)$/.exec(value);
-      const link = node("a", "", parts[1]);
-      link.href = parts[2]; link.target = "_blank"; link.rel = "noopener noreferrer";
-      element.append(link);
-    }
-    position = match.index + value.length;
-  }
-  element.append(document.createTextNode(text.slice(position)));
-}
-
-function renderMarkdown(text) {
-  const holder = node("div", "markdown");
-  const lines = text.replace(/\r\n/g, "\n").split("\n");
-  let paragraph = [], list = null;
-  function flush() {
-    if (paragraph.length) {
-      const p = node("p");
-      paragraph.forEach((line, i) => { if (i) p.append(document.createElement("br")); inlineText(p, line); });
-      holder.append(p); paragraph = [];
-    }
-    list = null;
-  }
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (/^\s*```/.test(line)) {
-      flush();
-      const language = line.trim().slice(3).trim();
-      const code = [];
-      while (++i < lines.length && !/^\s*```/.test(lines[i])) code.push(lines[i]);
-      const content = code.join("\n");
-      const block = node("div", "code-block");
-      const header = node("div", "code-heading");
-      const copy = node("button", "copy-code");
-      copy.type = "button";
-      copy.append(icon("copy"), document.createTextNode("复制"));
-      copy.addEventListener("click", async () => {
-        try { await navigator.clipboard.writeText(content); toast("代码已复制"); }
-        catch { toast("复制未成功，请选中代码后复制。"); }
-      });
-      header.append(node("span", "", language || "代码"), copy);
-      const pre = node("pre"); pre.append(node("code", "", content));
-      block.append(header, pre); holder.append(block);
-      continue;
-    }
-    if (!line.trim()) { flush(); continue; }
-    const heading = /^(#{1,4})\s+(.+)$/.exec(line);
-    if (heading) {
-      flush(); const h = node(`h${Math.min(4, heading[1].length + 1)}`);
-      inlineText(h, heading[2]); holder.append(h); continue;
-    }
-    const bullet = /^\s*(?:([-*])\s+|(\d+)\.\s+)(.+)$/.exec(line);
-    if (bullet) {
-      if (paragraph.length) flush();
-      const type = bullet[2] ? "OL" : "UL";
-      if (!list || list.tagName !== type) { list = node(type.toLowerCase()); holder.append(list); }
-      const li = node("li"); inlineText(li, bullet[3]); list.append(li); continue;
-    }
-    list = null; paragraph.push(line);
-  }
-  flush(); return holder;
-}
-
-function renderMessages(force = false) {
+function renderMessages() {
   const messages = state.session?.messages || [];
-  const signature = JSON.stringify([state.session?.id, messages]);
   $("empty-state").hidden = Boolean(messages.length);
   $("messages").hidden = !messages.length;
-  if (!force && signature === state.messagesSignature) return;
-  state.messagesSignature = signature;
-  const region = $("conversation");
-  const nearBottom = region.scrollHeight - region.scrollTop - region.clientHeight < 120;
-  const holder = $("messages"); holder.replaceChildren();
-  for (const item of messages) {
-    const section = node("article", `message ${item.role}${item.status ? ` ${item.status}` : ""}`);
-    section.setAttribute("aria-label", item.role === "user" ? "你的消息" : "Agent 回复");
-    if (item.role === "user") section.append(node("div", "message-content", item.content));
-    else {
-      const label = node("div", "message-label");
-      const mark = icon("spark"); mark.setAttribute("class", "mini-mark");
-      label.append(mark, document.createTextNode("Minimal Agent"));
-      const content = node("div", "message-content");
-      content.append(renderMarkdown(item.content)); section.append(label, content);
-    }
-    holder.append(section);
+  $("conversation").classList.toggle("has-messages", Boolean(messages.length));
+  if (!state.chat) {
+    state.chat = mountConversation($("messages"), {
+      send: async (text) => {
+        if (busy() || active(state.session?.run)) return;
+        $("message-input").value = text;
+        await sendMessage({ preventDefault() {} });
+      },
+      cancel: stopRun,
+    });
   }
-  if (nearBottom || force) requestAnimationFrame(() => { region.scrollTop = region.scrollHeight; });
+  state.chat.update({ sessionId: state.session?.id || null, messages,
+    run: state.session?.run || null, busy: busy() });
 }
 
 function renderRun() {
@@ -355,8 +278,9 @@ function renderRun() {
   button.disabled = busy() || !state.initialized || run?.status === "stopping";
   button.setAttribute("aria-label", running ? "停止运行" : "发送消息");
   button.replaceChildren(icon(running ? "stop" : "send"));
-  $("run-status").hidden = !running;
-  if (run?.status === "stopping") $("run-status").textContent = "正在停止，等待当前请求结束…";
+  $("run-status").hidden = !running && !state.sending;
+  if (state.sending && !running) $("run-status").textContent = "正在提交任务…";
+  else if (run?.status === "stopping") $("run-status").textContent = "正在停止当前任务…";
   else if (running) {
     const last = run.events?.at(-1);
     $("run-status").textContent = last?.event === "tool_call"
@@ -446,32 +370,143 @@ async function refreshSessions() {
   state.sessions = result.sessions; renderSessions();
 }
 
-function schedulePoll(id, revision, delay = 750) {
-  clearTimeout(state.poll);
-  state.poll = setTimeout(async () => {
-    if (revision !== state.revision || state.session?.id !== id) return;
-    try {
-      const result = await api(`/api/sessions/${id}`);
-      if (revision !== state.revision || state.session?.id !== id) return;
-      state.session = result.session;
-      connectionError(""); renderSession();
-      if (active(state.session.run)) schedulePoll(id, revision);
-      else await refreshSessions();
-    } catch (error) {
-      if (revision !== state.revision || state.session?.id !== id) return;
-      connectionError(error.message);
-      schedulePoll(id, revision, 2500);
+function closeStream() {
+  ++state.streamSerial;
+  state.stream?.close();
+  state.stream = null;
+  state.streamSequence = 0;
+}
+
+function queueStreamRender(full = false) {
+  state.renderFull ||= full;
+  if (state.renderTimer !== null) return;
+  // Coalesce fast token bursts without replaying text or replacing the whole thread.
+  state.renderTimer = setTimeout(() => {
+    state.renderTimer = null;
+    requestAnimationFrame(() => {
+      const fullRender = state.renderFull;
+      state.renderFull = false;
+      if (fullRender) renderSession();
+      else renderMessages();
+    });
+  }, 40);
+}
+
+function updateSessionSummary() {
+  const session = state.session;
+  if (!session) return;
+  const index = state.sessions.findIndex((item) => item.id === session.id);
+  const summary = { id: session.id, title: session.title, status: session.run?.status || "idle",
+    created_at: session.created_at, updated_at: session.updated_at };
+  if (index < 0) state.sessions.unshift(summary);
+  else Object.assign(state.sessions[index], summary);
+}
+
+function runMessage(runId) {
+  if (!runId || state.session?.run?.id !== runId) return null;
+  return state.session.messages.findLast((item) => item.role === "assistant" && item.run_id === runId) || null;
+}
+
+function connectStream(id, revision) {
+  closeStream();
+  const serial = state.streamSerial;
+  const source = new EventSource(`/api/sessions/${encodeURIComponent(id)}/events`);
+  state.stream = source;
+  const current = () => serial === state.streamSerial && revision === state.revision && state.session?.id === id;
+  const listen = (name, handle) => source.addEventListener(name, (event) => {
+    if (!current()) return;
+    let data;
+    try { data = JSON.parse(event.data); }
+    catch { connectionError("收到无效的实时更新，正在等待下一次同步。"); return; }
+    const sequence = Number(event.lastEventId);
+    // Replayed frames are idempotent, including reconnects after a network interruption.
+    if (event.lastEventId && Number.isSafeInteger(sequence)) {
+      if (name !== "snapshot" && sequence <= state.streamSequence) return;
+      state.streamSequence = sequence;
     }
-  }, delay);
+    if (name !== "snapshot" && data.run_id !== state.session?.run?.id) return;
+    handle(data);
+  });
+  source.onopen = () => { if (current()) connectionError(""); };
+  source.onerror = () => {
+    if (current()) connectionError("实时连接暂时中断，正在重新连接。任务仍在后台运行。");
+  };
+  listen("snapshot", ({ session }) => {
+    if (!session || session.id !== id) return;
+    state.session = session;
+    updateSessionSummary();
+    connectionError("");
+    queueStreamRender(true);
+    if (!active(session.run)) {
+      closeStream();
+      refreshSessions().catch((error) => connectionError(error.message));
+    }
+  });
+  listen("run_status", (data) => {
+    // A terminal snapshot commits messages and run state together before a new turn is allowed.
+    const status = active(data) ? data.status : state.session.run.status;
+    Object.assign(state.session.run, { status, step: data.step, error: data.error,
+      event_count: data.event_count, omitted_events: data.omitted_events });
+    const message = runMessage(data.run_id);
+    if (message) message.status = status;
+    updateSessionSummary();
+    queueStreamRender(true);
+  });
+  listen("segment", (data) => {
+    const message = runMessage(data.run_id);
+    if (!message || !data.segment?.id) return;
+    message.segments ||= [];
+    const index = message.segments.findIndex((segment) => segment.id === data.segment.id);
+    if (index < 0) message.segments.push(data.segment);
+    else message.segments[index] = data.segment;
+    if (message.segments.length > 80) message.segments.splice(0, message.segments.length - 80);
+    message.segments_omitted = data.segments_omitted ?? message.segments_omitted ?? 0;
+    queueStreamRender();
+  });
+  listen("segment_delta", (data) => {
+    const message = runMessage(data.run_id);
+    const segment = message?.segments?.find((item) => item.id === data.segment_id);
+    if (!segment || typeof data.text !== "string") return;
+    segment.text = (segment.text || "") + data.text;
+    queueStreamRender();
+  });
+  listen("trace", (data) => {
+    const run = state.session.run;
+    run.events ||= [];
+    if (data.event) run.events.push(data.event);
+    if (run.events.length > 100) run.events.splice(0, run.events.length - 100);
+    run.event_count = data.event_count;
+    run.omitted_events = data.omitted_events;
+    queueStreamRender(true);
+  });
+}
+
+async function recoverSession(id, revision, expectedRunId = null) {
+  const current = () => revision === state.revision && state.session?.id === id &&
+    (!expectedRunId || state.session?.run?.id === expectedRunId);
+  if (!current()) return;
+  closeStream();
+  try {
+    const result = await api(`/api/sessions/${id}`);
+    if (!current()) return;
+    state.session = result.session;
+    updateSessionSummary(); renderSession();
+    if (active(state.session.run)) connectStream(id, revision);
+  } catch (error) {
+    if (!current()) return;
+    connectionError(error.message);
+    // EventSource reconnects with Last-Event-ID; it never resubmits the user's task.
+    connectStream(id, revision);
+  }
 }
 
 async function selectSession(id) {
   if (busy()) return;
   saveDraft();
-  clearTimeout(state.poll);
+  closeStream();
   const revision = ++state.revision;
   if (!id) {
-    state.session = null; restoreDraft("draft"); renderSession(true); return;
+    state.session = null; connectionError(""); restoreDraft("draft"); renderSession(true); return;
   }
   state.selecting = true; renderRun();
   try {
@@ -479,17 +514,17 @@ async function selectSession(id) {
     if (revision !== state.revision) return;
     state.session = result.session;
     restoreDraft(id); renderSession(true);
-    if (active(state.session.run)) schedulePoll(id, revision);
+    if (active(state.session.run)) connectStream(id, revision);
   } catch (error) {
-    if (revision === state.revision && active(state.session?.run)) schedulePoll(state.session.id, revision);
+    if (revision === state.revision && active(state.session?.run)) connectStream(state.session.id, revision);
     throw error;
   } finally { state.selecting = false; renderRun(); }
 }
 
 function newChat() {
   if (busy()) return;
-  saveDraft(); clearTimeout(state.poll); ++state.revision;
-  state.session = null; state.drafts.delete("draft"); restoreDraft("draft");
+  saveDraft(); closeStream(); ++state.revision;
+  state.session = null; connectionError(""); state.drafts.delete("draft"); restoreDraft("draft");
   renderSession(true); $("message-input").focus();
 }
 
@@ -514,38 +549,48 @@ async function sendMessage(event) {
       if (revision !== state.revision) return;
       state.session = created.session;
     }
-    await api(`/api/sessions/${targetId}/messages`, { message });
+    const accepted = await api(`/api/sessions/${targetId}/messages`, { message });
     if (revision !== state.revision || state.session?.id !== targetId) return;
     $("message-input").value = ""; state.attachments = [];
     state.drafts.delete("draft"); state.drafts.delete(targetId);
     resizeInput(); renderAttachments(); renderFiles();
-    const result = await api(`/api/sessions/${targetId}`);
-    if (revision !== state.revision || state.session?.id !== targetId) return;
-    state.session = result.session; renderSession(true);
-    await refreshSessions();
-    if (revision === state.revision && active(state.session?.run)) schedulePoll(targetId, revision);
+    // Show the acknowledged run immediately; the first SSE snapshot is authoritative.
+    state.session.messages.push({ role: "user", content: message },
+      { role: "assistant", run_id: accepted.run_id, content: "", status: "running", segments: [], segments_omitted: 0 });
+    state.session.run = { id: accepted.run_id, status: "running", step: 0, events: [], event_count: 0, omitted_events: 0 };
+    if (!state.session.title || state.session.title === "新对话") state.session.title = text.slice(0, 42) || "文件任务";
+    updateSessionSummary(); renderSession(true);
+    connectStream(targetId, revision);
     connectionError("");
   } catch (error) {
     toast(error.message);
     if (targetId && revision === state.revision) {
       // Recover the actual server state after an uncertain POST response.
-      schedulePoll(targetId, revision, 500);
+      await recoverSession(targetId, revision);
     }
   } finally { state.sending = false; renderRun(); }
 }
 
 async function stopRun() {
-  const session = state.session;
-  if (!active(session?.run) || session.run.status === "stopping") return;
-  const revision = state.revision;
-  try {
-    const result = await api(`/api/sessions/${session.id}/stop`, { run_id: session.run.id });
-    if (revision !== state.revision || state.session?.id !== session.id) return;
-    state.session = result.session; renderSession(); schedulePoll(session.id, revision);
-  } catch (error) {
-    toast(error.message);
-    if (revision === state.revision) schedulePoll(session.id, revision, 100);
-  }
+  await stopCurrentRun({
+    read: () => ({ sessionId: state.session?.id || null, runId: state.session?.run?.id || null,
+      revision: state.revision, status: state.session?.run?.status }),
+    request: ({ sessionId, runId }) => api(`/api/sessions/${sessionId}/stop`, { run_id: runId }),
+    apply: (result, { sessionId, runId, revision }) => {
+      // An HTTP snapshot may predate SSE fragments received while the POST was in flight.
+      if (state.stream && active(state.session.run)) {
+        state.session.run.status = "stopping";
+        const message = runMessage(runId);
+        if (message) message.status = "stopping";
+      } else if (active(state.session.run)) state.session = result.session;
+      renderSession();
+      if (!state.stream && active(state.session.run)) connectStream(sessionId, revision);
+    },
+    recover: async (error, { sessionId, runId, revision }) => {
+      toast(error.message);
+      await recoverSession(sessionId, revision, runId);
+    },
+  });
 }
 
 function keyCanStay() {
@@ -663,6 +708,7 @@ async function uploadFiles() {
 }
 
 function bindEvents() {
+  window.addEventListener("beforeunload", closeStream);
   $("new-chat").addEventListener("click", newChat);
   $("open-settings").addEventListener("click", openSettings);
   $("settings-form").addEventListener("submit", saveSettings);

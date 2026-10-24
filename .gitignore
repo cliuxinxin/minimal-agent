@@ -11,3 +11,4 @@ workspace/*
 !workspace/requirements.json
 build/
 dist/
+frontend/node_modules/
