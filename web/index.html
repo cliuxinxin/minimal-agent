@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Minimal Agent · 工作台</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <svg class="icon-definitions" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <symbol id="i-spark" viewBox="0 0 24 24"><path d="M12 1c1.2 7.5 3.5 9.8 11 11-7.5 1.2-9.8 3.5-11 11C10.8 15.5 8.5 13.2 1 12 8.5 10.8 10.8 8.5 12 1Z"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="i-chat" viewBox="0 0 24 24"><path d="M20 15a3 3 0 0 1-3 3H7l-4 3V6a3 3 0 0 1 3-3h11a3 3 0 0 1 3 3z"/></symbol>
+    <symbol id="i-gear" viewBox="0 0 24 24"><path d="m9 3 1-2h4l1 2 2 1 2-.2 2 3-1 2v3l1 2-2 3-2-.2-2 1-1 2h-4l-1-2-2-1-2 .2-2-3 1-2V9L3 7l2-3 2 .2z" transform="translate(0 1) scale(1 .95)"/><circle cx="12" cy="11.5" r="3"/></symbol>
+    <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m9 5 7 7-7 7"/></symbol>
+    <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 7h18v12a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l3 4"/></symbol>
+    <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 2H5v20h14V7zm0 0v6h5M8 12h8M8 16h6"/></symbol>
+    <symbol id="i-chart" viewBox="0 0 24 24"><path d="M4 20v-7M9 20V8M14 20V3M19 20V6"/></symbol>
+    <symbol id="i-clip" viewBox="0 0 24 24"><path d="m8 13 7-7a3 3 0 0 1 4 4l-9 9a5 5 0 0 1-7-7L13 2a4 4 0 0 1 6 6l-9 9a2 2 0 0 1-3-3l8-8"/></symbol>
+    <symbol id="i-send" viewBox="0 0 24 24"><path d="M12 20V4m-7 7 7-7 7 7"/></symbol>
+    <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="m6 6 12 12M6 18 18 6"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+    <symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 16V3m-5 5 5-5 5 5M4 15v6h16v-6"/></symbol>
+    <symbol id="i-trace" viewBox="0 0 24 24"><path d="M9 5h12M9 12h12M9 19h12"/><circle cx="3" cy="5" r="1"/><circle cx="3" cy="12" r="1"/><circle cx="3" cy="19" r="1"/></symbol>
+    <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="13" rx="2"/><path d="M15 8V3H3v13h5"/></symbol>
+  </svg>
+
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar" aria-label="会话导航">
+      <div class="brand"><span class="brand-mark" aria-hidden="true"><svg><use href="#i-spark"/></svg></span><span>Minimal Agent</span></div>
+      <button class="button primary new-chat" id="new-chat"><svg class="icon"><use href="#i-plus"/></svg><span>新对话</span></button>
+      <div class="session-heading">会话</div>
+      <nav class="session-list" id="session-list" aria-label="对话列表"></nav>
+      <button class="settings-entry" id="open-settings"><svg class="icon"><use href="#i-gear"/></svg><span class="settings-entry-copy"><span>模型设置</span><small id="config-summary">尚未配置模型</small></span><svg class="icon small"><use href="#i-chevron"/></svg></button>
+    </aside>
+
+    <main class="workspace">
+      <header class="topbar">
+        <div class="workspace-heading"><h1>工作台</h1><span class="breadcrumb-slash">/</span><span class="conversation-title" id="conversation-title">新对话</span></div>
+        <div class="header-actions"><button class="button quiet trace-toggle" id="open-trace" hidden><svg class="icon"><use href="#i-trace"/></svg><span>运行记录</span></button><button class="button quiet files-toggle" id="open-files"><svg class="icon"><use href="#i-folder"/></svg><span>工作文件</span><span class="count" id="file-count">0</span></button></div>
+      </header>
+      <div class="model-line" id="model-line" hidden></div>
+      <div class="connection-banner" id="connection-banner" role="alert" hidden></div>
+
+      <section class="conversation" id="conversation" aria-label="对话内容">
+        <div class="empty-state" id="empty-state">
+          <h2>从一个任务开始。</h2>
+          <p>提问、读取文件，或让工具完成任务。</p>
+          <div class="prompt-shortcuts"><button class="button shortcut" id="summarize-file"><svg class="icon"><use href="#i-file"/></svg><span>总结一份文件</span></button><button class="button shortcut" id="analyze-question"><svg class="icon"><use href="#i-chart"/></svg><span>分析一个问题</span></button></div>
+        </div>
+        <div class="messages" id="messages" hidden></div>
+      </section>
+
+      <div class="composer-region">
+        <div class="run-status" id="run-status" role="status" aria-live="polite" hidden></div>
+        <form class="composer" id="message-form">
+          <div class="attachments" id="attachments" hidden></div>
+          <label class="sr-only" for="message-input">任务内容</label>
+          <textarea id="message-input" rows="3" maxlength="59000" placeholder="描述你想完成的任务…"></textarea>
+          <div class="composer-toolbar"><button class="attach-button" type="button" id="attach-file"><svg class="icon"><use href="#i-clip"/></svg><span>添加文件</span></button><button class="send-button" id="send-button" type="submit" aria-label="发送消息"><svg class="icon"><use href="#i-send"/></svg></button></div>
+        </form>
+        <p class="keyboard-hint">Enter 发送 · Shift + Enter 换行</p>
+      </div>
+    </main>
+  </div>
+
+  <dialog class="settings-dialog" id="settings-dialog" aria-labelledby="settings-title">
+    <form id="settings-form">
+      <div class="dialog-heading"><div><h2 id="settings-title">模型设置</h2><p>连接你使用的模型服务。</p></div><button class="icon-button" type="button" data-close="settings-dialog" aria-label="关闭模型设置"><svg class="icon"><use href="#i-close"/></svg></button></div>
+      <label for="provider">服务商</label>
+      <select id="provider" name="provider"><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option></select>
+      <label for="model">模型名称</label>
+      <input id="model" name="model" type="text" autocomplete="off" placeholder="填写你有权限使用的模型名称" required>
+      <label for="api-key">API Key</label>
+      <div class="password-field"><input id="api-key" name="api_key" type="password" autocomplete="new-password" placeholder="填写 API Key"><button type="button" class="icon-button" id="toggle-key" aria-label="显示 API Key" aria-pressed="false"><svg class="icon"><use href="#i-eye"/></svg></button></div>
+      <p class="field-hint" id="key-hint">密钥仅保存到本机配置，不保存在浏览器中。</p>
+      <label for="base-url">API 地址 <span class="optional">可选</span></label>
+      <input id="base-url" name="base_url" type="url" autocomplete="off" placeholder="https://api.openai.com/v1">
+      <p class="field-hint">留空使用服务商的官方地址。</p>
+      <p class="form-error" id="settings-error" role="alert" hidden></p>
+      <div class="dialog-footer"><span>修改后从新对话开始生效。</span><button class="button primary" id="save-settings" type="submit">保存设置</button></div>
+    </form>
+  </dialog>
+
+  <dialog class="drawer" id="files-dialog" aria-labelledby="files-title">
+    <div class="dialog-heading"><div><h2 id="files-title">工作文件</h2><p>添加到任务后，Agent 可以读取文件。</p></div><button class="icon-button" type="button" data-close="files-dialog" aria-label="关闭工作文件"><svg class="icon"><use href="#i-close"/></svg></button></div>
+    <button class="button primary upload-button" id="upload-files"><svg class="icon"><use href="#i-upload"/></svg><span>上传文件</span></button>
+    <input type="file" id="file-input" accept=".txt,.md,.json,.csv" multiple hidden>
+    <p class="field-hint upload-hint">UTF-8 文本 · TXT、MD、JSON、CSV · 每个最多 2 MiB</p>
+    <p class="form-error" id="files-error" role="alert" hidden></p>
+    <div class="file-list" id="file-list"></div>
+    <div class="drawer-footer">文件保存在本机 workspace 文件夹中。</div>
+  </dialog>
+
+  <dialog class="drawer trace-drawer" id="trace-dialog" aria-labelledby="trace-title">
+    <div class="dialog-heading"><div><h2 id="trace-title">运行记录</h2><p id="trace-subtitle">本次任务的模型请求与工具执行。</p></div><button class="icon-button" type="button" data-close="trace-dialog" aria-label="关闭运行记录"><svg class="icon"><use href="#i-close"/></svg></button></div>
+    <div class="trace-list" id="trace-list"></div>
+  </dialog>
+
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+</body>
+</html>

@@ -1,0 +1,12 @@
+config.json
+.env
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+runs/
+workspace/*
+!workspace/products.md
+!workspace/requirements.json
+build/
+dist/

@@ -1,0 +1,5 @@
+{
+  "provider": "openai",
+  "model": "your-model-name",
+  "api_key": "your-api-key"
+}
