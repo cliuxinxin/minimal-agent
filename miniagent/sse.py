@@ -7,6 +7,7 @@ import http.client
 import json
 import socket
 import threading
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Iterator
@@ -18,6 +19,10 @@ MAX_EVENT_BYTES = 256 * 1024
 
 class SSEError(Exception):
     """A fixed, safe error message; never contains a provider response body."""
+
+    def __init__(self, message: str, *, diagnostic: dict | None = None):
+        super().__init__(message)
+        self.diagnostic = dict(diagnostic or {})
 
 
 class SSECancelled(SSEError):
@@ -143,7 +148,7 @@ def _events(response, cancellation: _Cancellation) -> Iterator[SSEEvent]:
             return  # An unterminated event is not an SSE event.
         total += len(chunk)
         if total >= MAX_STREAM_BYTES:
-            raise SSEError("Model stream exceeded the size limit")
+            raise SSEError("Model stream exceeded the size limit", diagnostic={"code": "stream_size_limit", "phase": "transport"})
         for byte in chunk:
             if skip_lf:
                 skip_lf = False
@@ -151,7 +156,7 @@ def _events(response, cancellation: _Cancellation) -> Iterator[SSEEvent]:
                     continue
             size += 1
             if size > MAX_EVENT_BYTES:
-                raise SSEError("Model stream event exceeded the size limit")
+                raise SSEError("Model stream event exceeded the size limit", diagnostic={"code": "event_size_limit", "phase": "transport"})
             if byte not in (10, 13):
                 line.append(byte)
                 continue
@@ -159,7 +164,7 @@ def _events(response, cancellation: _Cancellation) -> Iterator[SSEEvent]:
             try:
                 text = line.decode("utf-8")
             except UnicodeError:
-                raise SSEError("Model stream was not valid UTF-8") from None
+                raise SSEError("Model stream was not valid UTF-8", diagnostic={"code": "invalid_stream_utf8", "phase": "transport"}) from None
             line.clear()
             if first_line:
                 text = text.removeprefix("\ufeff")
@@ -181,28 +186,49 @@ def _events(response, cancellation: _Cancellation) -> Iterator[SSEEvent]:
                     event = value or None
 
 
+def _response_metadata(response, request_headers, metadata):
+    """Keep only status and a bounded request identifier, never arbitrary headers."""
+    status = getattr(response, "status", None)
+    if type(status) is int:
+        metadata["http_status"] = status
+    secrets = [value.removeprefix("Bearer ") for name, value in request_headers.items()
+               if name.lower() in {"authorization", "x-api-key", "api-key"} and isinstance(value, str) and value]
+    for name in ("x-request-id", "request-id"):
+        value = response.headers.get(name)
+        if (isinstance(value, str) and 0 < len(value) <= 200
+                and all(ch.isascii() and (ch.isalnum() or ch in "-_.:") for ch in value)
+                and not any(secret and secret in value for secret in secrets)):
+            metadata["request_id"] = value
+            break
+
+
 @contextmanager
-def open_sse(endpoint: str, headers: dict, body: dict, should_stop: Callable[[], bool] | None = None):
+def open_sse(endpoint: str, headers: dict, body: dict, should_stop: Callable[[], bool] | None = None, *, metadata: dict | None = None):
     """One streaming POST; no redirects, retries, or provider error-body exposure."""
     cancellation = _Cancellation(should_stop)
-    cancellation.check()
+    metadata = {} if metadata is None else metadata
+    started = time.monotonic()
     try:
-        data = json.dumps(body, ensure_ascii=False, allow_nan=False).encode("utf-8")
-        request = urllib.request.Request(endpoint, data=data, headers={"Content-Type": "application/json", "Accept": "text/event-stream", **headers}, method="POST")
-    except (TypeError, ValueError, UnicodeError):
-        raise SSEError("Model request could not be encoded") from None
-    cancellation.start()
-    try:
+        cancellation.check()
+        try:
+            data = json.dumps(body, ensure_ascii=False, allow_nan=False).encode("utf-8")
+            request = urllib.request.Request(endpoint, data=data, headers={"Content-Type": "application/json", "Accept": "text/event-stream", **headers}, method="POST")
+        except (TypeError, ValueError, UnicodeError):
+            raise SSEError("Model request could not be encoded", diagnostic={"code": "request_encoding_error", "phase": "request"}) from None
+        cancellation.start()
         with _opener(cancellation).open(request, timeout=60) as response:
+            _response_metadata(response, headers, metadata)
             cancellation.check()
             yield _events(response, cancellation)
             cancellation.check()
     except urllib.error.HTTPError as error:
+        _response_metadata(error, headers, metadata)
         error.close()
         cancellation.check()
-        raise SSEError(f"Model endpoint returned HTTP {error.code}") from None
+        raise SSEError(f"Model endpoint returned HTTP {error.code}", diagnostic={"code": "http_error", "phase": "response_headers"}) from None
     except (TimeoutError, urllib.error.URLError, OSError, http.client.HTTPException):
         cancellation.check()
-        raise SSEError("Model request failed or timed out") from None
+        raise SSEError("Model request failed or timed out", diagnostic={"code": "transport_error", "phase": "transport"}) from None
     finally:
         cancellation.close()
+        metadata["elapsed_ms"] = max(0, int((time.monotonic() - started) * 1000))

@@ -1,4 +1,5 @@
-import type { MessageStatus, ThreadAssistantMessagePart, ThreadMessageLike } from "@assistant-ui/react";
+import type { MessageStatus, ThreadAssistantMessagePart, ThreadMessageLike, ToolCallMessagePartStatus } from "@assistant-ui/react";
+import type { RunDiagnostic } from "./run-diagnostic";
 
 type Segment = {
   id: string;
@@ -21,12 +22,20 @@ type Message = {
   status?: string;
   segments?: Segment[];
   segments_omitted?: number;
+  diagnostic?: RunDiagnostic;
 };
 export type ConversationInput = {
   sessionId: string | null;
   messages: Message[];
-  run?: { id: string; status: string; step?: number; error?: string | null } | null;
+  run?: { id: string; status: string; step?: number; error?: string | null; diagnostic?: RunDiagnostic } | null;
   busy?: boolean;
+};
+export type ToolArtifact = {
+  phase?: string;
+  segmentId?: string;
+  callId?: string;
+  argumentsTruncated?: boolean;
+  displayStatus?: ToolCallMessagePartStatus;
 };
 const running = (status?: string) => status === "running" || status === "stopping";
 
@@ -34,10 +43,13 @@ export function convertMessage(message: Message, index: number, input: Conversat
   const id = message.run_id || `${input.sessionId || "draft"}-${message.role}-${index}`;
   if (message.role === "user") return { id, role: "user", content: message.content };
   const isRunning = running(message.status);
+  const report = message.diagnostic ?? (message.run_id === input.run?.id ? input.run?.diagnostic : undefined);
+  const diagnostic = report?.run_id === message.run_id ? report : undefined;
   const status: MessageStatus = isRunning ? { type: "running" }
     : message.status === "cancelled" ? { type: "incomplete", reason: "cancelled" }
       : message.status === "error" ? { type: "incomplete", reason: "error",
-        error: message.run_id === input.run?.id ? input.run?.error || "本次任务未完成。" : "本次任务未完成，可查看本机运行记录。" }
+        error: (message.run_id === input.run?.id ? input.run?.error : undefined) || diagnostic?.error?.message ||
+          "本次任务未完成，可查看本机运行记录。" }
         : { type: "complete", reason: "stop" };
   let segments = message.segments || [];
   let fullAnswerFallback: string | undefined;
@@ -68,7 +80,18 @@ export function convertMessage(message: Message, index: number, input: Conversat
       let args = {};
       try { args = JSON.parse(segment.arguments || "{}"); } catch { /* Partial args remain in argsText. */ }
       if (!args || typeof args !== "object" || Array.isArray(args)) args = {};
-      const settled = ["completed", "error", "cancelled"].includes(segment.status || "");
+      let phase = segment.status;
+      if (!isRunning && phase === "preparing") phase = "not_executed";
+      else if (!isRunning && phase === "running") phase = "interrupted";
+      // Older snapshots discarded the original execution phase on a parent error.
+      // With no tool result or tool error, report the unknown outcome as interrupted.
+      else if (["error", "cancelled"].includes(phase || "") &&
+        !Object.hasOwn(segment, "result") && segment.error === undefined) phase = "interrupted";
+      const cancelled = message.status === "cancelled" || segment.status === "cancelled";
+      const displayStatus: ToolCallMessagePartStatus = phase === "completed" ? { type: "complete" }
+        : ["preparing", "running"].includes(phase || "") ? { type: "running" }
+          : { type: "incomplete", reason: cancelled ? "cancelled" : "error",
+            ...(segment.error === undefined ? {} : { error: segment.error }) };
       content.push({
         type: "tool-call",
         // The provider call ID can arrive late; the host's segment ID is stable from the first delta.
@@ -76,8 +99,13 @@ export function convertMessage(message: Message, index: number, input: Conversat
         toolName: segment.name || "准备调用工具",
         args,
         argsText: segment.arguments || "",
-        ...(settled ? { result: segment.error ?? segment.result ?? null, isError: segment.status === "error" } : {}),
-        artifact: { phase: segment.status, segmentId: segment.id, callId: segment.call_id, argumentsTruncated: Boolean(segment.arguments_truncated) },
+        // Absence is meaningful: only a real tool_result can supply a result, including null.
+        ...(Object.hasOwn(segment, "result") ? { result: segment.result } : {}),
+        isError: ["error", "not_executed", "interrupted"].includes(phase || ""),
+        // assistant-ui infers a completed tool whenever a result exists. Keep the
+        // host's execution outcome explicit for the standard ToolFallback renderer.
+        artifact: { phase, displayStatus, segmentId: segment.id, callId: segment.call_id,
+          argumentsTruncated: Boolean(segment.arguments_truncated) } satisfies ToolArtifact,
       });
       continue;
     }
@@ -103,9 +131,10 @@ export function convertMessage(message: Message, index: number, input: Conversat
       runId: message.run_id,
       custom: {
         uiStatus: message.status || "completed",
-        step: message.run_id === input.run?.id ? input.run?.step || 0 : 0,
+        step: message.run_id === input.run?.id ? input.run?.step || 0 : diagnostic?.step || 0,
         segmentsOmitted: message.segments_omitted || 0,
         fullAnswerFallback,
+        diagnostic,
       },
     },
   };

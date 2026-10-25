@@ -158,7 +158,11 @@ function ToolFallbackTrigger({
 
   const Icon = statusIconMap[statusType];
   const label =
-    responseDeliveryStatus === "queued"
+    phase === "not_executed"
+      ? "未执行"
+      : phase === "interrupted"
+        ? "已中断"
+        : responseDeliveryStatus === "queued"
       ? "回复待发送"
       : statusType === "running"
         ? phase === "preparing" ? "正在生成参数" : "正在执行"

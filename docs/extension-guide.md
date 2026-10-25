@@ -102,7 +102,7 @@ agent = Agent(model, build_tools(Path("workspace")), max_steps=80)
 
 ## 观察和核验
 
-`run()` 返回 `RunResult`，状态为 `completed`、`step_limit`、`model_error`、`cancelled` 或 `stalled`，另含 `answer`、`steps`、`tool_calls`、`error`。判断状态后再使用答案；模型结束不等于业务结果正确。`on_event` 可接收运行事件，网页与 CLI 将事件写入 `./runs/*.jsonl`；任务、模型文本和工具结果可能包含业务内容。
+`run()` 返回 `RunResult`，状态为 `completed`、`step_limit`、`model_error`、`cancelled` 或 `stalled`，另含 `answer`、`steps`、`tool_calls`、`error` 和可选 `diagnostic`。新增字段有默认值，原有调用方式继续有效。判断状态后再使用答案；模型结束不等于业务结果正确。`on_event` 可接收运行事件，网页与 CLI 将事件写入 `./runs/*.jsonl`；任务、模型文本和工具结果可能包含业务内容。
 
 后台线程可以用 `agent.run(task, should_stop=stop_event.is_set)` 协作式停止。检查发生在模型调用前、回复后和工具之间；流式模型传输会主动关闭正在等待数据的连接。非流式请求、搜索及一般同步 handler 会等到返回或超时。编程工具通过 `miniagent.tools.execution_stopped()` 获取取消状态并终止子进程；你也可以在自定义长任务中检查这个函数。已经完整接收的工具调用会收到对应的 `cancelled` 错误结果；未完整接收的模型回复不加入原生历史，也不执行工具。
 
@@ -122,6 +122,12 @@ result = agent.run("读取 products.md 并总结")
 新模型适配器可实现 `stream(messages, tools, system_prompt, *, on_delta, should_stop=None) -> ModelReply`。它在接收数据时调用 `on_delta`，在验证正常终止后返回完整 `ModelReply`。增量类型为 `text_delta`、`reasoning_delta` 与 `tool_call_delta`；工具增量含 `index`、累计的 `id` / `name` 和本次 `arguments_delta`。工具参数只能在完整回复通过验证后执行。
 
 核心事件仍含 `run_id`、`event`、`step`、`time`、`data`。`model_complete` 表示单次模型回复结束，其 `data` 含 `text` 和 `has_tool_calls`；随后才可能出现 `tool_call` / `tool_result`。`model_output` 含原生消息，只用于本地内部日志，不发送给网页。只实现 `complete()` 的自定义模型仍可运行，公开文本会一次送达，不模拟逐字流式。
+
+模型适配器可通过 `ModelError(message, diagnostic={...})` 提供结构化故障信息。允许字段包括 `code`、`phase`、`field`、`expected`、`actual_type`、`chunk_index`、`event_type`、`finish_reason`、`http_status`、`request_id`、`elapsed_ms` 和只含类型/长度的 `chunk_shape`。不要将原始响应、请求头、提示词或工具参数放入诊断字段。Agent 将诊断附在 `RunResult.diagnostic` 和 `run_end`；异常的代码位置只记录文件名、函数名和行号，不记录源码、局部变量或完整路径。
+
+网页宿主会为失败生成 `schema_version=1` 的报告，补充版本、会话/运行编号、连接信息、工具状态和最近阶段事件。报告附在失败的 assistant 消息与当前 run 的 `diagnostic` 上，随终态 SSE `snapshot` 到达前端；开始下一轮不覆盖旧消息的报告。同一份报告原子写入 `runs/<run_id>.diagnostic.json`。写入失败时保留页面报告，`diagnostic_file=null`，`storage_error` 仅含异常类型。
+
+流式工具片段的 `status` 为 `preparing`、`running`、`completed`、`error`、`cancelled`、`not_executed` 或 `interrupted`。`not_executed` 表示未进入工具执行，`interrupted` 表示已开始但没有收到结果；缺少 `result` 和真实结果为 JSON `null` 是不同状态，前端不能将两者混为成功。
 
 内置只读文件工具是 `list_files` 和 `read_file`，范围固定在 `workspace/`；Python API 可通过 `load_agent(..., workspace=Path(...))` 指定工作目录。编程工具具有当前用户的 Python 权限。自定义工具应自行约束访问范围、设置超时，并避免把凭据传给模型。
 

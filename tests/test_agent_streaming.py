@@ -12,6 +12,36 @@ from miniagent.tools import Tool
 
 
 class AgentStreamingTests(unittest.TestCase):
+    def test_model_failure_preserves_structured_diagnostics_without_raw_payloads(self):
+        events = []
+
+        class DetailedFailure(RuntimeError):
+            diagnostic = {
+                'code': 'invalid_stream_field', 'phase': 'stream_parse',
+                'field': 'choices[0].delta.tool_calls[0].function.arguments',
+                'expected': 'string or null', 'actual_type': 'array',
+                'chunk_index': 3, 'request_id': 'request-123',
+                'raw_response': {'content': 'private upstream content'},
+                'headers': {'Authorization': 'private credential'},
+            }
+
+        class BrokenModel(ScriptedModel):
+            def stream(self, messages, tools, system_prompt, *, on_delta, should_stop=None):
+                raise DetailedFailure('Invalid streamed tool arguments')
+
+        result = Agent(BrokenModel(), stream=True, on_event=events.append).run('private task')
+        self.assertIsNotNone(getattr(result, 'diagnostic', None),
+                             'Agent discarded the adapter diagnostics')
+        self.assertEqual(result.diagnostic['field'],
+                         'choices[0].delta.tool_calls[0].function.arguments')
+        self.assertEqual(result.diagnostic['chunk_index'], 3)
+        self.assertEqual(result.diagnostic['type'], 'DetailedFailure')
+        self.assertEqual(events[-1]['data']['diagnostic'], result.diagnostic)
+        encoded = json.dumps(result.diagnostic)
+        for private in ('private upstream content', 'private credential', 'private task',
+                        'raw_response', 'Authorization'):
+            self.assertNotIn(private, encoded)
+
     def test_stream_delivers_before_reply_and_executes_only_validated_calls(self):
         events, executed = [], []
         tool = Tool('add', 'Add.', AddArgs,

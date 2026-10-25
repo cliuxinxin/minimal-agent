@@ -1,12 +1,12 @@
 {
   "assets": {
     "chat.js": {
-      "bytes": 991110,
-      "sha256": "3bdc96cb5c86408453e624aef8ccb68149b7da13c4407c8b81c67c9653610c03"
+      "bytes": 997058,
+      "sha256": "096fc1ab7ba89552989e0a4aac83ad256b2e13f6d472a260ed70e7bb9f7282a7"
     },
     "chat.css": {
-      "bytes": 38732,
-      "sha256": "a2f5b077302573e0cb46ab0fcdc04fb1b80d0783440cd33c9ac2944395417c8c"
+      "bytes": 41126,
+      "sha256": "10c3adcdecca12c5b00a5013067cbb17ff7915d1e69e580d1023bc4f66ed0b1b"
     },
     "THIRD_PARTY_NOTICES.txt": {
       "bytes": 219899,

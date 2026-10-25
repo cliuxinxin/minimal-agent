@@ -27,6 +27,7 @@
 - **思考内容**：接口实际返回的公开思考内容或摘要显示在可展开区域。兼容 OpenAI 格式的 `reasoning_content` 和 Anthropic 的 `thinking_delta`；没有返回内容时只显示运行状态，不生成假的思考过程。签名和加密思考块不会发送到页面。
 - **Markdown**：支持标题、粗体、引用、嵌套列表、表格、任务列表、删除线、代码高亮与复制。流式过程中会处理尚未闭合的格式，完成后按原文渲染。
 - **查看执行过程**：对话保留最近 80 个文字、思考或工具片段，长文字片段显示截断提示；记录抽屉保留最近 100 条阶段事件。完整运行事件保存在本机 `runs/`。
+- **故障诊断**：失败消息下方可展开“诊断信息”，复制或下载 JSON 报告。报告记录运行编号、模型与接口、失败阶段、错误字段和类型、流片段编号，以及接口提供的请求编号；同一份报告自动保存在本机 `runs/`。
 - **编程**：`run_python` 在本机 Python 子进程中运行代码，可读取工作文件、生成结果、执行计算和处理文本。原来的 Calculator 已移除。
 - **创建工具**：`create_tool` 运行样例测试，结果与预期相符才保存。下一次模型请求就能使用新工具；新对话和重启后也能使用。点击网页“工具”可查看已保存的代码和样例。
 - **联网搜索**：`web_search` 搜索网页并返回真实来源链接；`fetch_webpage` 获取网页正文并支持分段读取。填入 DeepSeek 搜索 Key 后启用。
@@ -87,6 +88,7 @@ DeepSeek 搜索使用 `POST https://api.deepseek.com/v1/tools/search`，正文�
 | `miniagent/web.py` | 本地 HTTP/SSE 接口、会话、上传、后台运行和日志 |
 | `miniagent/agent.py` | 模型调用 → 工具选择 → 验证和审批 → 执行 → 回传结果 |
 | `miniagent/model.py`、`miniagent/sse.py` | 两家服务的原生流式适配器与有界 SSE 传输 |
+| `miniagent/diagnostics.py` | 有界诊断字段、异常位置和可分享报告的本地保存 |
 | `miniagent/tools.py` | `ToolArgs` 严格参数验证和 `Tool` 执行边界 |
 | `miniagent/builtin_tools.py` | `list_files`、`read_file` |
 | `miniagent/programming.py`、`miniagent/python_worker.py` | Python 子进程、样例测试、工具保存与动态加载 |
@@ -94,9 +96,19 @@ DeepSeek 搜索使用 `POST https://api.deepseek.com/v1/tools/search`，正文�
 | `miniagent/config.py` | 兼容已有配置，并统一装配 Agent、编程和搜索工具 |
 | `launcher.py` | 双击启动、首次安装依赖和打开浏览器 |
 
-每个会话使用一个 `Agent` 实例。默认每个任务最多调用模型 80 次，可选 800 次或不限制次数；一次模型回复可以包含多个工具调用，程序会把所有结果交回模型。`run()` 返回 `RunResult(status, answer, steps, tool_calls, error)`，状态为 `completed`、`step_limit`、`model_error`、`cancelled` 或 `stalled`。`completed` 表示模型给出最终回答，仍需按业务标准核验结果。
+每个会话使用一个 `Agent` 实例。默认每个任务最多调用模型 80 次，可选 800 次或不限制次数；一次模型回复可以包含多个工具调用，程序会把所有结果交回模型。`run()` 返回 `RunResult(status, answer, steps, tool_calls, error, diagnostic=None)`，状态为 `completed`、`step_limit`、`model_error`、`cancelled` 或 `stalled`。`completed` 表示模型给出最终回答，仍需按业务标准核验结果。
 
 你可以直接通过聊天创建工具，也可以手写参数类、处理函数并注册，具体见 [扩展指南](docs/extension-guide.md)。文件读取工具限制在 `workspace/`；编程工具使用真实本机 Python 权限。默认宿主策略仅允许本次提供的编程工具及由它加载的工具对象，开发者另外加入的写工具仍需要自己的明确授权策略。
+
+## 出错时如何反馈
+
+展开失败消息下方的 **诊断信息**，点击 **复制诊断** 或 **下载 JSON**，把报告提供给维护者即可。报告中有版本号、运行编号、失败阶段与工具执行状态；流式字段错误会带具体字段路径、预期类型、实际类型和流片段编号。HTTP 状态码与上游请求编号仅在接口提供时显示。
+
+报告自动保存为 `runs/<运行编号>.diagnostic.json`，对应完整运行日志为 `runs/<运行编号>.jsonl`。关闭服务后这些文件仍保留，原目录更新代码不会删除；磁盘写入失败时页面仍可复制或下载报告，并显示保存失败。
+
+诊断报告只收集协议结构、类型、状态和代码位置，不收集请求头、原始响应正文、用户任务、思考正文或工具参数/结果；已配置的模型和搜索密钥会再次脱敏。完整 JSONL 日志含任务及工具数据，排查时优先分享诊断报告。
+
+工具状态以宿主实际执行为准：**未执行** 表示参数仍在生成时运行就结束了，**已中断** 表示已发起执行但未收到结果，只有实际成功的工具结果才显示 **已完成**。模型流式参数中的可选 `null` 字段按“该字段本次没有更新”处理；错误数据类型、无效 JSON 和未完整结束的工具调用仍会报告错误，不会执行残缺参数。
 
 ## 开发者入口
 

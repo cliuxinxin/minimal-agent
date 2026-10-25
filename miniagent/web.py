@@ -19,8 +19,10 @@ import webbrowser
 
 from pydantic import ValidationError
 
+from . import __version__
 from .builtin_tools import build_tools
 from .config import _Config, load_agent
+from .diagnostics import diagnostic_fields, exception_diagnostic, write_diagnostic
 from .model import AnthropicModel, OpenAIModel
 from .programming import ProgrammingTools
 from .search import build_search_tools
@@ -130,8 +132,19 @@ class RunPresentation:
     def __init__(self, state, session, run, message):
         self.state, self.session, self.run, self.message = state, session, run, message
         self.trace = JsonlTrace(state.root / 'runs')
+        self.trace_error = None
         self.channels, self.identities, self.text_lengths, self.omitted_text_lengths = {}, {}, {}, {}
         self.counter = 0
+
+    def log(self, event):
+        if self.trace_error is not None:
+            return
+        try:
+            self.trace(event)
+        except OSError as failure:
+            # A full/unwritable disk must not strand an active run or suppress
+            # its in-memory diagnostic and terminal SSE snapshot.
+            self.trace_error = type(failure).__name__
 
     def publish_segment(self, segment):
         self.state.publish(self.session, 'segment', {'run_id': self.run['id'], 'segment': segment,
@@ -251,7 +264,7 @@ class RunPresentation:
         safe = {key: value for key, value in event.items() if key != 'data'}
         safe.update(run_id=self.run['id'], data=data)
         channel.update(event=safe, field=field)
-        self.trace(safe)
+        self.log(safe)
         self.consume_delta(kind, step, data)
 
     def flush(self, step=None):
@@ -262,7 +275,7 @@ class RunPresentation:
             if tail:
                 event = copy.deepcopy(channel['event'])
                 event['data'][channel['field']] = tail
-                self.trace(event)
+                self.log(event)
                 self.consume_delta(key[0], key[1], event['data'])
             del self.channels[key]
 
@@ -277,7 +290,7 @@ class RunPresentation:
                 self.flush(event.get('step') if kind == 'model_complete' else None)
             safe = redact(event, self.session['secret'])
             safe['run_id'] = self.run['id']
-            self.trace(safe)
+            self.log(safe)
             if kind == 'model_output':
                 return  # Native signed/encrypted blocks belong only in local history/logs.
             displayed = browser_event(safe)
@@ -463,6 +476,7 @@ class WebState:
                       config.search_api_key.get_secret_value().strip()),
                   'created_at': timestamp, 'updated_at': timestamp, 'messages': [], 'run': None}
         self.sessions[sid] = {'detail': detail, 'agent': agent,
+                              'endpoint': self.model(config).endpoint,
                               'secret': [config.api_key.get_secret_value(),
                                          config.search_api_key.get_secret_value() if config.search_api_key else ''],
                               'stop': None, 'sequence': 0, 'run_sequence': 0,
@@ -523,6 +537,7 @@ class WebState:
         if detail['run'] and detail['run']['status'] in ACTIVE:
             raise RequestError(409, '该对话仍在运行，请等待或停止。')
         run = {'id': uuid4().hex, 'status': 'running', 'step': 0, 'error': None, 'events': [],
+               'started_at': now(),
                'event_count': 0, 'omitted_events': 0}
         session['stop'] = threading.Event()
         detail['run'] = run
@@ -545,13 +560,16 @@ class WebState:
             assistant = self.assistant_message(session, run)
             presentation = RunPresentation(self, session, run, assistant)
         session['agent'].on_event = presentation.on_event
+        diagnostic = None
         try:
             result = session['agent'].run(message, should_stop=session['stop'].is_set)
             status = result.status if result.status in {'completed', 'cancelled'} else 'error'
             error = redact(result.error, session['secret'])
             answer = redact(result.answer, session['secret'])
-        except Exception:
+            diagnostic = diagnostic_fields(getattr(result, 'diagnostic', None))
+        except Exception as failure:
             status, error, answer = 'error', '运行遇到内部错误，请检查配置后重试。', ''
+            diagnostic = exception_diagnostic(failure, phase='host_run')
         with self.lock:
             presentation.flush()
             if status == 'completed':
@@ -563,17 +581,66 @@ class WebState:
                 content = partial + '\n\n' + notice if partial else notice
             for segment in assistant['segments']:
                 if segment['type'] == 'tool' and segment['status'] in {'preparing', 'running'}:
-                    segment['status'] = 'cancelled' if status == 'cancelled' else 'error'
+                    unstarted = segment['status'] == 'preparing'
+                    segment['status'] = 'not_executed' if unstarted else 'interrupted'
+                    segment['error'] = {
+                        'code': 'cancelled' if status == 'cancelled' else 'run_incomplete',
+                        'message': ('工具参数尚未生成完整，本次工具未执行。' if unstarted else
+                                    '运行已中断，尚未收到工具执行结果。'),
+                    }
                     presentation.publish_segment(segment)
             run.update(status=status, error=error)
             assistant.update(content=content, status=status)
             session['detail']['updated_at'] = now()
+            if status == 'error':
+                report = self.failure_report(session, run, assistant, diagnostic,
+                                             trace_error=presentation.trace_error)
+                try:
+                    write_diagnostic(self.root, report)
+                except (OSError, ValueError, TypeError) as failure:
+                    report['diagnostic_file'] = None
+                    report['storage_error'] = type(failure).__name__
+                run['diagnostic'] = assistant['diagnostic'] = report
             self.publish_status(session, run)
             self.publish(session, 'snapshot', {'session': session['detail']})
 
+    @staticmethod
+    def failure_report(session, run, assistant, diagnostic, *, trace_error=None):
+        detail = session['detail']
+        error = diagnostic_fields(diagnostic)
+        error_message = run['error']
+        if error.get('code') == 'unexpected_error':
+            # Unexpected exceptions may embed user text, file contents or other
+            # business data. The local trace retains them; the shareable report
+            # keeps the exception class, stage and code location instead.
+            error_message = f"Unexpected {error.get('type', 'error')} during {error.get('phase', 'agent_run')}."
+        report = {
+            'schema_version': 1, 'app_version': __version__,
+            'run_id': run['id'], 'session_id': detail['id'],
+            'started_at': run['started_at'], 'finished_at': detail['updated_at'],
+            'status': run['status'], 'step': run['step'],
+            'connection': {'provider': detail['provider'], 'model': detail['model'],
+                           'endpoint': session['endpoint'], 'stream': True},
+            'error': {'code': 'run_incomplete', 'phase': 'agent_run',
+                      **error, 'message': error_message},
+            'tools': [{
+                'name': part['name'], 'call_id': part['call_id'], 'status': part['status'],
+                'step': part['step'], 'arguments_chars': len(part['arguments']),
+                'has_result': 'result' in part,
+            } for part in assistant['segments'] if part['type'] == 'tool'],
+            'events': [{key: event[key] for key in ('event', 'step', 'time') if key in event}
+                       for event in run['events']],
+            'omitted_events': run['omitted_events'],
+            'log_file': None if trace_error else f"runs/{run['id']}.jsonl",
+            'diagnostic_file': f"runs/{run['id']}.diagnostic.json",
+        }
+        if trace_error:
+            report['log_error'] = trace_error
+        return redact(report, session['secret'])
+
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = 'MinimalAgent/0.4.0'
+    server_version = f'MinimalAgent/{__version__}'
 
     def log_message(self, *args):
         pass  # Do not log bodies, keys, or user messages.
@@ -717,7 +784,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == '/favicon.ico':
                 return 204, b'', 'image/x-icon'
             if path == '/api/health':
-                result = {'app': 'minimal-agent-web', 'version': '0.4.0',
+                result = {'app': 'minimal-agent-web', 'version': __version__,
                           'workspace_id': hashlib.sha256(str(state.root).encode()).hexdigest()[:12]}
             elif path in {'/api/bootstrap', '/api/config'}:
                 result = {'config': state.masked_config()}

@@ -141,6 +141,184 @@ class StreamingTests(unittest.TestCase):
                 with self.assertRaises(ModelError):
                     self.stream(OpenAIModel("test", "key", base))
 
+    def test_openai_nullable_tool_delta_fields_preserve_assembled_values(self):
+        # The documented streaming schema permits explicit null for optional
+        # fields; treating it differently from an omitted field breaks assembly.
+        fragments = [
+            {"index": 0, "id": None},
+            {"index": 0, "type": None},
+            {"index": 0, "function": None},
+            {"index": 0, "function": {"name": None}},
+            {"index": 0, "function": {"arguments": None}},
+        ]
+        for fragment in fragments:
+            chunks = [
+                frame(openai({"tool_calls": [{"index": 0, "id": "call_0", "type": "function", "function": {"name": "read_file", "arguments": '{"path":'}}]})),
+                frame(openai({"tool_calls": [fragment]})),
+                frame(openai({"tool_calls": [{"index": 0, "function": {"arguments": '"hello.py"}'}}]}, "tool_calls")),
+                frame("[DONE]"),
+            ]
+            with self.subTest(fragment=fragment), provider_server(chunks) as (base, requests, _):
+                reply = self.stream(OpenAIModel("test", "key", base))
+                self.assertEqual(reply.tool_calls, [ToolCall("call_0", "read_file", '{"path":"hello.py"}')])
+                self.assertEqual(len(requests), 1)
+
+    def test_openai_documented_nullable_tool_deltas_follow_reasoning(self):
+        chunks = [
+            frame(openai({"reasoning_content": "I will read the file."})),
+            frame(openai({"content": None, "tool_calls": [{"index": 0, "id": "call_0", "type": "function", "function": {"name": "read_file", "arguments": ""}}]})),
+            frame(openai({"content": None, "tool_calls": [{"index": 0, "id": None, "type": None, "function": {"name": None, "arguments": '{"path":"'}}]})),
+            frame(openai({"content": None, "tool_calls": [{"index": 0, "id": None, "type": None, "function": {"name": None, "arguments": 'hello.py"}'}}]})),
+            frame(openai({"content": None, "tool_calls": None}, "tool_calls")),
+            frame("[DONE]"),
+        ]
+        deltas = []
+        with provider_server(chunks) as (base, _, _):
+            reply = self.stream(OpenAIModel("test", "key", base), on_delta=deltas.append)
+        self.assertEqual(reply.tool_calls, [ToolCall("call_0", "read_file", '{"path":"hello.py"}')])
+        self.assertEqual(reply.message["reasoning_content"], "I will read the file.")
+        self.assertEqual([d["arguments_delta"] for d in deltas if d["type"] == "tool_call_delta"], ["", '{"path":"', 'hello.py"}'])
+
+    def test_openai_invalid_tool_delta_reports_safe_field_diagnostic(self):
+        secret = "private-test-key"
+        payload = openai({"tool_calls": [{"index": 0, "function": {"arguments": {"private_payload": "private argument value"}}}]})
+        payload["private extra key"] = "private response value"
+        chunks = [
+            frame(openai({"reasoning_content": "private reasoning value"})),
+            frame(openai({"tool_calls": [{"index": 0, "id": "call_0", "type": "function", "function": {"name": "read_file", "arguments": '{"path":'}}]})),
+            frame(payload),
+        ]
+        with provider_server(chunks, headers={"X-Request-Id": "req-test-123", "Set-Cookie": "private cookie"}) as (base, requests, _):
+            with self.assertRaises(ModelError) as caught:
+                self.stream(OpenAIModel("test", secret, base), messages=[{"role": "user", "content": "private prompt value"}])
+            self.assertEqual(len(requests), 1)
+        diagnostic = caught.exception.diagnostic
+        self.assertEqual(diagnostic["code"], "invalid_stream_field")
+        self.assertEqual(diagnostic["phase"], "stream_delta")
+        self.assertEqual(diagnostic["field"], "choices[0].delta.tool_calls[0].function.arguments")
+        self.assertEqual(diagnostic["expected"], "string or null")
+        self.assertEqual(diagnostic["actual_type"], "object")
+        self.assertEqual(diagnostic["chunk_index"], 3)
+        self.assertEqual(diagnostic["http_status"], 200)
+        self.assertEqual(diagnostic["request_id"], "req-test-123")
+        self.assertGreaterEqual(diagnostic["elapsed_ms"], 0)
+        safe = json.dumps(diagnostic)
+        self.assertIn("arguments", safe)
+        self.assertLess(len(safe), 8192)
+        for private in (secret, "private_payload", "private argument value", "private response value", "private extra key", "private reasoning value", "private prompt value", "private cookie"):
+            self.assertNotIn(private, safe)
+
+    def test_openai_invalid_field_types_are_not_coerced_to_absent(self):
+        cases = [
+            ({"index": True}, "index", "boolean"),
+            ({"index": 0, "id": 0}, "id", "integer"),
+            ({"index": 0, "type": False}, "type", "boolean"),
+            ({"index": 0, "function": []}, "function", "array"),
+            ({"index": 0, "function": {"name": False}}, "function.name", "boolean"),
+            ({"index": 0, "function": {"arguments": {}}}, "function.arguments", "object"),
+        ]
+        for fragment, field, actual_type in cases:
+            chunks = [frame(openai({"tool_calls": [fragment]})), frame("[DONE]")]
+            with self.subTest(field=field), provider_server(chunks) as (base, _, _):
+                with self.assertRaises(ModelError) as caught:
+                    self.stream(OpenAIModel("test", "key", base))
+            self.assertEqual(caught.exception.diagnostic["field"], f"choices[0].delta.tool_calls[0].{field}")
+            self.assertEqual(caught.exception.diagnostic["actual_type"], actual_type)
+
+    def test_http_failure_diagnostic_contains_allowlisted_metadata_only(self):
+        with provider_server([b"private response body"], status=429, headers={"X-Request-Id": "req-rate-limit-123", "Authorization": "private response header"}) as (base, requests, _):
+            with self.assertRaises(ModelError) as caught:
+                self.stream(OpenAIModel("test", "private-test-key", base))
+            self.assertEqual(len(requests), 1)
+        diagnostic = caught.exception.diagnostic
+        self.assertEqual(diagnostic["code"], "http_error")
+        self.assertEqual(diagnostic["phase"], "response_headers")
+        self.assertEqual(diagnostic["http_status"], 429)
+        self.assertEqual(diagnostic["request_id"], "req-rate-limit-123")
+        self.assertGreaterEqual(diagnostic["elapsed_ms"], 0)
+        self.assertNotIn("private", json.dumps(diagnostic))
+
+    def test_request_id_does_not_echo_credentials(self):
+        secret = "private-test-key"
+        with provider_server([frame(openai({"content": 1}))], headers={"X-Request-Id": "req-" + secret}) as (base, _, _):
+            with self.assertRaises(ModelError) as caught:
+                self.stream(OpenAIModel("test", secret, base))
+        self.assertNotIn(secret, json.dumps(caught.exception.diagnostic))
+        self.assertNotIn("request_id", caught.exception.diagnostic)
+
+    def test_openai_nullable_deltas_cannot_complete_missing_tool_fields(self):
+        for field, code in (("id", "incomplete_response"), ("name", "incomplete_response"), ("arguments", "invalid_tool_arguments")):
+            call = {"index": 0, "id": "call_0", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}
+            (call if field == "id" else call["function"])[field] = None
+            chunks = [frame(openai({"tool_calls": [call]}, "tool_calls")), frame("[DONE]")]
+            with self.subTest(field=field), provider_server(chunks) as (base, requests, _):
+                with self.assertRaises(ModelError) as caught:
+                    self.stream(OpenAIModel("test", "key", base))
+                self.assertEqual(len(requests), 1)
+            self.assertEqual(caught.exception.diagnostic["code"], code)
+
+    def test_openai_protocol_guard_diagnostics_distinguish_failure_phases(self):
+        cases = [
+            ([frame(openai({"content": "partial"}, "stop"))], "missing_terminal_marker", "stream_finish"),
+            ([frame(openai({"content": "partial"}, "length")), frame("[DONE]")], "incomplete_response", "stream_finish"),
+            ([frame(openai({"content": "done"}, "stop")), frame(openai({"content": "late"})), frame("[DONE]")], "data_after_finish", "stream_delta"),
+            ([frame(openai({"content": "done"}, "stop")), frame(openai(reason="tool_calls")), frame("[DONE]")], "conflicting_finish_reason", "stream_delta"),
+            ([frame({"choices": [{"index": 0, "delta": None, "finish_reason": "stop"}]}), frame("[DONE]")], "invalid_stream_field", "stream_delta"),
+        ]
+        for chunks, code, phase in cases:
+            with self.subTest(code=code), provider_server(chunks, headers={"X-Request-Id": "req-final-123"}) as (base, requests, _):
+                with self.assertRaises(ModelError) as caught:
+                    self.stream(OpenAIModel("test", "key", base))
+                self.assertEqual(len(requests), 1)
+            diagnostic = caught.exception.diagnostic
+            self.assertEqual((diagnostic["code"], diagnostic["phase"]), (code, phase))
+            self.assertEqual(diagnostic["request_id"], "req-final-123")
+            self.assertEqual(diagnostic["http_status"], 200)
+
+    def test_stream_shape_diagnostic_is_bounded_and_opaque(self):
+        private = {"content": "private text", "arguments": {"private key": "private argument"}}
+        payload = openai({"content": [private] * 100})
+        payload["usage"] = {"choices": [private] * 100, "private usage key": "private usage"}
+        with provider_server([frame(payload)]) as (base, _, _):
+            with self.assertRaises(ModelError) as caught:
+                self.stream(OpenAIModel("test", "key", base))
+        diagnostic = json.dumps(caught.exception.diagnostic)
+        self.assertLess(len(diagnostic), 8192)
+        self.assertNotIn("private", diagnostic)
+        self.assertIn("content", diagnostic)
+
+    def test_anthropic_malformed_event_reports_safe_chunk_context(self):
+        chunks = [
+            anthropic("message_start", message={"role": "assistant", "content": []}),
+            anthropic("content_block_start", index=0, content_block={"type": "text", "text": ""}),
+            anthropic("content_block_delta", index=0, delta={"type": "text_delta", "text": {"private field": "private text"}}),
+        ]
+        with provider_server(chunks, headers={"Request-Id": "req-anthropic-123"}) as (base, requests, _):
+            with self.assertRaises(ModelError) as caught:
+                self.stream(AnthropicModel("test", "private-key", base))
+            self.assertEqual(len(requests), 1)
+        diagnostic = caught.exception.diagnostic
+        self.assertEqual(diagnostic["code"], "invalid_stream_field")
+        self.assertEqual(diagnostic["phase"], "stream_event")
+        self.assertEqual(diagnostic["chunk_index"], 3)
+        self.assertEqual(diagnostic["event_type"], "content_block_delta")
+        self.assertEqual(diagnostic["http_status"], 200)
+        self.assertEqual(diagnostic["request_id"], "req-anthropic-123")
+        self.assertIn("delta", json.dumps(diagnostic["chunk_shape"]))
+        self.assertNotIn("private", json.dumps(diagnostic))
+
+    def test_anthropic_incomplete_finish_retains_response_metadata(self):
+        with provider_server(anthropic_text(reason="max_tokens"), headers={"Request-Id": "req-anthropic-finish-123"}) as (base, _, _):
+            with self.assertRaises(ModelError) as caught:
+                self.stream(AnthropicModel("test", "private-key", base))
+        diagnostic = caught.exception.diagnostic
+        self.assertEqual(diagnostic["code"], "incomplete_response")
+        self.assertEqual(diagnostic["phase"], "stream_finish")
+        self.assertEqual(diagnostic["finish_reason"], "max_tokens")
+        self.assertEqual(diagnostic["event_type"], "message_stop")
+        self.assertEqual(diagnostic["http_status"], 200)
+        self.assertEqual(diagnostic["request_id"], "req-anthropic-finish-123")
+
     def test_openai_rejects_duplicate_tool_argument_keys(self):
         for arguments in ('{"a":1,"a":99,"b":2}', '{"nested":{"a":1,"a":99}}'):
             chunks = [

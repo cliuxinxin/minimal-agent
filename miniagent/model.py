@@ -36,6 +36,10 @@ class ChatModel(Protocol):
 class ModelError(Exception):
     """The provider failed or returned an incomplete or malformed response."""
 
+    def __init__(self, message: str, *, diagnostic: dict | None = None):
+        super().__init__(message)
+        self.diagnostic = dict(diagnostic or {})
+
 
 class ModelCancelled(ModelError):
     """The caller stopped an in-flight provider request."""
@@ -103,14 +107,80 @@ def _nonempty(value: object) -> bool:
 
 
 @contextmanager
-def _stream_events(endpoint, headers, body, should_stop):
+def _stream_events(endpoint, headers, body, should_stop, *, diagnostic=None):
+    diagnostic = {} if diagnostic is None else diagnostic
     try:
-        with open_sse(endpoint, headers, body, should_stop) as events:
+        with open_sse(endpoint, headers, body, should_stop, metadata=diagnostic) as events:
             yield events
     except SSECancelled:
-        raise ModelCancelled("Model request cancelled") from None
+        raise ModelCancelled("Model request cancelled", diagnostic={**diagnostic, "code": "cancelled", "phase": "transport"}) from None
     except SSEError as error:
-        raise ModelError(str(error)) from None
+        raise ModelError(str(error), diagnostic={**diagnostic, **error.diagnostic}) from None
+    except ModelError as error:
+        error.diagnostic = {**diagnostic, **error.diagnostic}
+        raise
+
+
+_MISSING = object()
+
+
+def _value_type(value):
+    if value is _MISSING:
+        return "missing"
+    return {type(None): "null", bool: "boolean", int: "integer", float: "number",
+            str: "string", list: "array", dict: "object"}.get(type(value), "unknown")
+
+
+def _chunk_shape(payload):
+    """Bounded structural diagnostics; never retain keys or values from content."""
+    keys = {"choices", "delta", "index", "finish_reason", "content", "reasoning_content",
+            "tool_calls", "id", "type", "function", "name", "arguments", "role", "refusal",
+            "error", "message", "usage", "object", "content_block", "partial_json",
+            "signature", "thinking", "input", "stop_reason", "data", "text"}
+    opaque = {"content", "reasoning_content", "arguments", "refusal", "error", "partial_json",
+              "signature", "thinking", "input", "data", "text"}
+    remaining = 64
+
+    def describe(value, depth=0, inspect=True):
+        nonlocal remaining
+        result = {"type": _value_type(value)}
+        if isinstance(value, (dict, list, str)):
+            result["length"] = len(value)
+        remaining -= 1
+        if not inspect or depth >= 8 or remaining <= 0:
+            return result
+        if isinstance(value, dict):
+            fields = {}
+            for key in value:
+                if key in keys and remaining > 0:
+                    fields[key] = describe(value[key], depth + 1, key not in opaque)
+            if fields:
+                result["fields"] = fields
+            if len(value) > len(fields):
+                result["omitted_fields"] = len(value) - len(fields)
+        elif isinstance(value, list):
+            result["items"] = [describe(item, depth + 1) for item in value[:3] if remaining > 0]
+        return result
+
+    return describe(payload)
+
+
+class _StreamFieldError(ValueError):
+    def __init__(self, field, expected, value, *, code="invalid_stream_field"):
+        super().__init__()
+        self.diagnostic = {"code": code, "field": field, "expected": expected, "actual_type": _value_type(value)}
+
+
+def _typed(value, kind, field, expected=None):
+    if not isinstance(value, kind):
+        raise _StreamFieldError(field, expected or {dict: "object", list: "array", str: "string"}[kind], value)
+    return value
+
+
+def _finish_reason(value):
+    known = {"stop", "tool_calls", "length", "content_filter", "function_call", "end_turn",
+             "tool_use", "max_tokens", "stop_sequence", "pause_turn", "refusal"}
+    return value if value is None or isinstance(value, str) and value in known else "unknown"
 
 
 def _json_object(data: str) -> dict:
@@ -130,25 +200,29 @@ def _json_object(data: str) -> dict:
         if not isinstance(payload, dict):
             raise ValueError
     except (ValueError, UnicodeError):
-        raise ModelError("Model stream contained invalid JSON") from None
+        raise ModelError("Model stream contained invalid JSON", diagnostic={"code": "invalid_stream_json", "phase": "stream_decode"}) from None
     return payload
 
 
 def _stream_payload(data: str) -> dict:
     payload = _json_object(data)
     if payload.get("error") or payload.get("type") == "error":
-        raise ModelError("Model endpoint reported a streaming error")
+        raise ModelError("Model endpoint reported a streaming error", diagnostic={"code": "provider_stream_error", "phase": "stream_event", "chunk_shape": _chunk_shape(payload)})
     return payload
 
 
-def _index(value):
+def _index(value, field=None):
     if type(value) is not int or not 0 <= value < 1024:
+        if field is not None:
+            raise _StreamFieldError(field, "integer from 0 to 1023", value)
         raise ValueError
     return value
 
 
-def _string(value):
+def _string(value, field=None, expected="string"):
     if not isinstance(value, str):
+        if field is not None:
+            raise _StreamFieldError(field, expected, value)
         raise ValueError
     return value
 
@@ -219,65 +293,86 @@ class OpenAIModel:
         calls: dict[int, dict] = {}
         reason = None
         terminal = False
-        with _stream_events(self.endpoint, {"Authorization": f"Bearer {self._api_key}"}, body, should_stop) as events:
-            for event in events:
+        diagnostic = {"phase": "stream_delta", "chunk_index": 0, "finish_reason": None}
+        with _stream_events(self.endpoint, {"Authorization": f"Bearer {self._api_key}"}, body, should_stop, diagnostic=diagnostic) as events:
+            for chunk_index, event in enumerate(events, 1):
+                diagnostic["chunk_index"] = chunk_index
                 if event.data.strip() == "[DONE]":
                     terminal = True
                     break
+                diagnostic["event_type"] = "chat.completion.chunk"
+                diagnostic.pop("chunk_shape", None)
                 payload = _stream_payload(event.data)
+                diagnostic["chunk_shape"] = _chunk_shape(payload)
                 try:
-                    choices = payload["choices"]
-                    if not isinstance(choices, list):
-                        raise ValueError
-                    for choice in choices:
-                        if _index(choice["index"]) != 0:
+                    choices = _typed(payload.get("choices", _MISSING), list, "choices")
+                    for choice_position, choice in enumerate(choices):
+                        choice_path = f"choices[{choice_position}]"
+                        _typed(choice, dict, choice_path)
+                        if _index(choice.get("index", _MISSING), f"{choice_path}.index") != 0:
                             continue
-                        delta = choice["delta"]
-                        if not isinstance(delta, dict):
-                            raise ValueError
+                        finish = choice.get("finish_reason")
+                        if finish is not None:
+                            diagnostic["finish_reason"] = _finish_reason(finish)
+                        delta_path = f"{choice_path}.delta"
+                        delta = _typed(choice.get("delta", _MISSING), dict, delta_path)
                         if reason is not None and delta:
-                            raise ValueError
+                            raise _StreamFieldError(delta_path, "empty delta after finish_reason", delta, code="data_after_finish")
                         for field, event_type in (("content", "text_delta"), ("reasoning_content", "reasoning_delta")):
                             value = delta.get(field)
                             if value is not None:
-                                value = _string(value)
+                                value = _string(value, f"{delta_path}.{field}", "string or null")
                                 message[field] = (message.get(field) or "") + value
                                 if value:
                                     on_delta({"type": event_type, "text": value})
                         fragments = delta.get("tool_calls")
                         if fragments is None:
                             fragments = []
-                        if not isinstance(fragments, list):
-                            raise ValueError
-                        for fragment in fragments:
-                            index = _index(fragment["index"])
+                        _typed(fragments, list, f"{delta_path}.tool_calls", "array or null")
+                        for fragment_position, fragment in enumerate(fragments):
+                            fragment_path = f"{delta_path}.tool_calls[{fragment_position}]"
+                            _typed(fragment, dict, fragment_path)
+                            index = _index(fragment.get("index", _MISSING), f"{fragment_path}.index")
                             call = calls.setdefault(index, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
-                            if fragment.get("type", "function") != "function":
-                                raise ValueError
-                            if "id" in fragment:
-                                call["id"] += _string(fragment["id"])
-                            function = fragment.get("function", {})
-                            if not isinstance(function, dict):
-                                raise ValueError
-                            if "name" in function:
-                                call["function"]["name"] += _string(function["name"])
-                            arguments = _string(function.get("arguments", ""))
+                            # Stream fields are optional/nullable: null means no
+                            # update, not a null value in the completed tool call.
+                            if fragment.get("type") not in (None, "function"):
+                                raise _StreamFieldError(f"{fragment_path}.type", "function or null", fragment["type"])
+                            if fragment.get("id") is not None:
+                                call["id"] += _string(fragment["id"], f"{fragment_path}.id", "string or null")
+                            function = fragment.get("function")
+                            if function is None:
+                                function = {}
+                            _typed(function, dict, f"{fragment_path}.function", "object or null")
+                            if function.get("name") is not None:
+                                call["function"]["name"] += _string(function["name"], f"{fragment_path}.function.name", "string or null")
+                            arguments = function.get("arguments")
+                            arguments = "" if arguments is None else _string(arguments, f"{fragment_path}.function.arguments", "string or null")
                             call["function"]["arguments"] += arguments
                             on_delta({"type": "tool_call_delta", "index": index, "id": call["id"], "name": call["function"]["name"], "arguments_delta": arguments})
-                        finish = choice.get("finish_reason")
                         if finish is not None:
+                            _string(finish, f"{choice_path}.finish_reason", "string or null")
                             if reason is not None and reason != finish:
-                                raise ValueError
-                            reason = _string(finish)
-                except (KeyError, IndexError, TypeError, ValueError, AttributeError):
-                    raise ModelError("OpenAI stream contained invalid message or tool-call fields") from None
+                                raise _StreamFieldError(f"{choice_path}.finish_reason", "unchanged finish_reason", finish, code="conflicting_finish_reason")
+                            reason = finish
+                except (KeyError, IndexError, TypeError, ValueError, AttributeError) as error:
+                    details = getattr(error, "diagnostic", {"code": "invalid_stream_field"})
+                    raise ModelError("OpenAI stream contained invalid message or tool-call fields", diagnostic=details) from None
         if not terminal:
-            raise ModelError("OpenAI stream ended before its terminal marker")
+            raise ModelError("OpenAI stream ended before its terminal marker", diagnostic={**diagnostic, "code": "missing_terminal_marker", "phase": "stream_finish"})
         if calls:
-            for call in calls.values():
-                _json_object(call["function"]["arguments"])
+            for index, call in calls.items():
+                try:
+                    _json_object(call["function"]["arguments"])
+                except ModelError as error:
+                    error.diagnostic = {**diagnostic, "code": "invalid_tool_arguments", "phase": "tool_arguments", "field": f"tool_calls[{index}].function.arguments", "expected": "JSON object with unique keys", "actual_type": "string"}
+                    raise
             message["tool_calls"] = [calls[index] for index in sorted(calls)]
-        return self._reply({"choices": [{"message": message, "finish_reason": reason}]})
+        try:
+            return self._reply({"choices": [{"message": message, "finish_reason": reason}]})
+        except ModelError as error:
+            error.diagnostic = {**diagnostic, "code": "incomplete_response", "phase": "stream_finish"}
+            raise
 
     def tool_messages(self, results: list[dict]) -> list[dict]:
         return [{"role": "tool", "tool_call_id": result["id"], "content": json.dumps(result["payload"], ensure_ascii=False)} for result in results]
@@ -340,11 +435,19 @@ class AnthropicModel:
         started = terminal = False
         reason = None
         headers = {"x-api-key": self._api_key, "anthropic-version": "2023-06-01"}
-        with _stream_events(self.endpoint, headers, body, should_stop) as events:
-            for event in events:
+        diagnostic = {"phase": "stream_event", "chunk_index": 0, "finish_reason": None}
+        known_events = {"message_start", "content_block_start", "content_block_delta", "content_block_stop",
+                        "message_delta", "message_stop", "ping", "error"}
+        with _stream_events(self.endpoint, headers, body, should_stop, diagnostic=diagnostic) as events:
+            for chunk_index, event in enumerate(events, 1):
+                diagnostic["chunk_index"] = chunk_index
+                diagnostic["event_type"] = event.event if event.event in known_events else "unknown"
+                diagnostic.pop("chunk_shape", None)
                 payload = _stream_payload(event.data)
+                diagnostic["chunk_shape"] = _chunk_shape(payload)
                 try:
                     kind = payload["type"]
+                    diagnostic["event_type"] = kind if isinstance(kind, str) and kind in known_events else "unknown"
                     if kind == "message_start":
                         if started or payload["message"].get("content") != []:
                             raise ValueError
@@ -413,6 +516,7 @@ class AnthropicModel:
                             raise ValueError
                         finish = payload["delta"].get("stop_reason")
                         if finish is not None:
+                            diagnostic["finish_reason"] = _finish_reason(finish)
                             reason = _string(finish)
                     elif kind == "message_stop":
                         if not started or len(closed) != len(blocks):
@@ -421,10 +525,14 @@ class AnthropicModel:
                         break
                     # ping and future event types carry no local tool side effects.
                 except (KeyError, IndexError, TypeError, ValueError, AttributeError):
-                    raise ModelError("Anthropic stream contained invalid content or tool-use fields") from None
+                    raise ModelError("Anthropic stream contained invalid content or tool-use fields", diagnostic={"code": "invalid_stream_field"}) from None
         if not terminal:
-            raise ModelError("Anthropic stream ended before its terminal marker")
-        return self._reply({"content": [blocks[index] for index in sorted(blocks)], "stop_reason": reason})
+            raise ModelError("Anthropic stream ended before its terminal marker", diagnostic={**diagnostic, "code": "missing_terminal_marker", "phase": "stream_finish"})
+        try:
+            return self._reply({"content": [blocks[index] for index in sorted(blocks)], "stop_reason": reason})
+        except ModelError as error:
+            error.diagnostic = {**diagnostic, "code": "incomplete_response", "phase": "stream_finish"}
+            raise
 
     def tool_messages(self, results: list[dict]) -> list[dict]:
         if not results:

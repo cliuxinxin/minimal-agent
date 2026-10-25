@@ -49,6 +49,7 @@
     "Chinese labels and existing desktop styling are applied to the official elements.",
     "MarkdownText disables synthetic smooth reveal, repairs only active display text with Remend, restricts clickable URLs to HTTP(S), and renders image references as text.",
     "SyntaxHighlighter uses the official PrismLight adapter with directly imported common languages so no language module or asset is fetched at runtime.",
-    "The cn workspace helper is replaced with its standard clsx and tailwind-merge implementation."
+    "The cn workspace helper is replaced with its standard clsx and tailwind-merge implementation.",
+    "ToolFallback uses the host execution phase for interrupted, unexecuted, failed, and cancelled tools; missing results stay absent. Thread adds a local diagnostic disclosure using the same Base UI collapsible and button elements, with copy/download of the host-redacted report."
   ]
 }

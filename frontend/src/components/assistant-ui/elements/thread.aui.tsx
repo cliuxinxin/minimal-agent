@@ -25,6 +25,8 @@ import { ToolFallback } from "./tool-fallback.aui";
 import { TooltipIconButton } from "./tooltip-icon-button";
 import { CollapsibleRoot, CollapsibleTrigger, CollapsibleContent } from "./collapsible-root";
 import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
+import type { ToolArtifact } from "@/message-adapter";
+import { DiagnosticDisclosure } from "./diagnostic-disclosure";
 
 const groupBy = groupPartByType({ reasoning: ["group-reasoning"] });
 
@@ -170,9 +172,8 @@ function AssistantMessage() {
                     <p className="segment-note">此段为截断预览，完整过程见本机运行记录。</p>}
                 </div>;
               case "tool-call": {
-                const artifact = part.artifact as { phase?: string; segmentId?: string; argumentsTruncated?: boolean } | undefined;
-                const toolStatus = artifact?.phase === "cancelled"
-                  ? { type: "incomplete" as const, reason: "cancelled" as const } : part.status;
+                const artifact = part.artifact as ToolArtifact | undefined;
+                const toolStatus = artifact?.displayStatus ?? part.status;
                 return (
                   <div className="inline-tool" data-status={artifact?.phase} data-segment-id={artifact?.segmentId}>
                     <ToolFallback {...part} status={toolStatus} />
@@ -189,6 +190,7 @@ function AssistantMessage() {
         </MessagePrimitive.GroupedParts>
         <FullAnswer />
         <MessageNotice />
+        <DiagnosticDisclosure />
         <ActionBarPrimitive.Root hideWhenRunning autohide="not-last" className="aui-assistant-action-bar">
           <CopyAnswer />
         </ActionBarPrimitive.Root>

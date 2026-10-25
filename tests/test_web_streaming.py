@@ -6,6 +6,7 @@ import tempfile
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from miniagent.agent import RunResult
@@ -384,8 +385,132 @@ class WebStreamingTests(unittest.TestCase):
         self.assertEqual(detail['run']['status'], 'error')
         self.assertEqual(assistant['status'], 'error')
         self.assertEqual(assistant['segments'][0]['text'], '尚未结束的回答')
-        self.assertEqual(assistant['segments'][1]['status'], 'error')
+        self.assertEqual(assistant['segments'][1]['status'], 'not_executed')
+        self.assertNotIn('result', assistant['segments'][1])
+        self.assertIn('未执行', assistant['segments'][1]['error']['message'])
         self.assertIn('尚未结束的回答', assistant['content'])
+
+    def test_failure_diagnostic_is_redacted_persisted_and_kept_on_the_original_message(self):
+        turns = []
+        def program(emit, stopping):
+            turns.append('turn')
+            if len(turns) > 1:
+                return RunResult('completed', '继续成功', 1, 0)
+            emit('run_start', task='private user request')
+            emit('model_start')
+            emit('reasoning_delta', text='private provider reasoning')
+            emit('tool_call_delta', index=0, id='call-1', name='web_search',
+                 arguments_delta='{"query":"private search query')
+            return SimpleNamespace(status='model_error', answer='', steps=1, tool_calls=0,
+                error='Invalid arguments sk-very-secret-token', diagnostic={
+                    'type': 'ModelError', 'code': 'invalid_stream_field', 'phase': 'stream_parse',
+                    'field': 'choices[0].delta.tool_calls[0].function.arguments',
+                    'expected': 'string or null', 'actual_type': 'array', 'chunk_index': 3,
+                    'request_id': 'req-search-secret-token', 'http_status': 200,
+                    'chunk_shape': {'choices': [{'delta': {'tool_calls': [{'function': {
+                        'arguments': {'type': 'array', 'length': 1}}}]}}]},
+                    'raw_body': 'private raw response', 'headers': {'Authorization': 'raw key'},
+                })
+        sid, _ = self.prepare(program)
+        run_id = self.start(sid)
+        detail = self.done(sid)
+        assistant = detail['messages'][-1]
+        self.assertIn('diagnostic', assistant, 'Failure has no copyable diagnostic report')
+        report = assistant['diagnostic']
+        self.assertEqual(report['run_id'], run_id)
+        self.assertEqual(report['session_id'], sid)
+        self.assertEqual(report['connection']['provider'], 'openai')
+        self.assertEqual(report['connection']['model'], 'test-model')
+        self.assertEqual(report['connection']['endpoint'], 'https://api.openai.com/v1/chat/completions')
+        self.assertTrue(report['connection']['stream'])
+        self.assertEqual(report['error']['field'],
+                         'choices[0].delta.tool_calls[0].function.arguments')
+        self.assertEqual(report['error']['actual_type'], 'array')
+        self.assertEqual(report['error']['request_id'], 'req-[redacted]')
+        self.assertEqual(report['tools'][0]['status'], 'not_executed')
+        self.assertFalse(report['tools'][0]['has_result'])
+        self.assertEqual(report, detail['run']['diagnostic'])
+        encoded = json.dumps(report, ensure_ascii=False)
+        for private in ('sk-very-secret-token', 'search-secret-token', 'private user request',
+                        'private provider reasoning', 'private search query', 'private raw response',
+                        'raw key', 'Authorization', 'raw_body'):
+            self.assertNotIn(private, encoded)
+        path = self.root / report['diagnostic_file']
+        self.assertTrue(path.is_file())
+        self.assertEqual(json.loads(path.read_text(encoding='utf-8')), report)
+        self.start(sid)
+        followup = self.done(sid)
+        self.assertEqual(followup['messages'][1]['diagnostic'], report)
+        self.assertNotIn('diagnostic', followup['messages'][-1])
+
+    def test_failed_run_distinguishes_unstarted_interrupted_and_finished_tools(self):
+        def program(emit, stopping):
+            emit('tool_call', id='finished', name='list_files', arguments='{}')
+            emit('tool_result', id='finished', name='list_files', ok=True, result=[])
+            emit('tool_call', id='active', name='run_python', arguments='{}')
+            emit('tool_call_delta', index=2, id='unstarted', name='web_search', arguments_delta='{')
+            raise RuntimeError('host failed')
+        sid, _ = self.prepare(program)
+        self.start(sid)
+        parts = self.done(sid)['messages'][-1]['segments']
+        self.assertEqual([part['status'] for part in parts],
+                         ['completed', 'interrupted', 'not_executed'])
+        self.assertEqual(parts[0]['result'], [])
+        self.assertNotIn('result', parts[1])
+        self.assertNotIn('result', parts[2])
+        self.assertIn('中断', parts[1]['error']['message'])
+
+    def test_unexpected_host_failure_keeps_safe_exception_location(self):
+        def program(emit, stopping):
+            raise RuntimeError('a secret business value must not be exported')
+        sid, _ = self.prepare(program)
+        self.start(sid)
+        assistant = self.done(sid)['messages'][-1]
+        self.assertIn('diagnostic', assistant)
+        error = assistant['diagnostic']['error']
+        self.assertEqual(error['type'], 'RuntimeError')
+        self.assertEqual(error['phase'], 'host_run')
+        self.assertEqual(error['stack'][-1]['function'], 'program')
+        self.assertEqual(error['stack'][-1]['file'], 'test_web_streaming.py')
+        self.assertIsInstance(error['stack'][-1]['line'], int)
+        self.assertNotIn('a secret business value', json.dumps(assistant['diagnostic']))
+
+    def test_real_agent_diagnostic_omits_unexpected_exception_business_content(self):
+        from miniagent.model import OpenAIModel
+        sid = self.request('POST', '/api/sessions', {})[1]['session']['id']
+        with patch.object(OpenAIModel, 'stream', side_effect=RuntimeError('PRIVATE_USER_PAYLOAD_831')):
+            self.start(sid)
+            assistant = self.done(sid)['messages'][-1]
+        self.assertEqual(assistant['diagnostic']['error']['type'], 'RuntimeError')
+        self.assertEqual(assistant['diagnostic']['error']['phase'], 'model_request')
+        self.assertNotIn('PRIVATE_USER_PAYLOAD_831', json.dumps(assistant['diagnostic']))
+
+    def test_log_and_report_write_failures_do_not_prevent_terminal_snapshot(self):
+        def program(emit, stopping):
+            # This is withheld by the split-key redactor until terminal flush.
+            emit('text_delta', text='sk-very-')
+            raise RuntimeError('upstream interrupted')
+        sid, _ = self.prepare(program)
+        from miniagent.tracing import JsonlTrace
+        original = JsonlTrace.__call__
+        def fail_on_final_flush(trace, event):
+            if event.get('data', {}).get('text') == 'sk-very-':
+                raise OSError('private disk path must not be exported')
+            return original(trace, event)
+        with patch.object(JsonlTrace, '__call__', fail_on_final_flush), \
+                patch('miniagent.web.write_diagnostic', side_effect=PermissionError('private path')):
+            self.start(sid)
+            detail = self.done(sid)
+        self.assertEqual(detail['run']['status'], 'error')
+        report = detail['messages'][-1]['diagnostic']
+        self.assertIsNone(report['diagnostic_file'])
+        self.assertIsNone(report['log_file'])
+        self.assertEqual(report['storage_error'], 'PermissionError')
+        self.assertEqual(report['log_error'], 'OSError')
+        self.assertNotIn('private', json.dumps(report))
+        snapshot = self.connect(sid).frame()
+        self.assertEqual(snapshot['event'], 'snapshot')
+        self.assertEqual(snapshot['data']['session']['run']['status'], 'error')
 
     def test_model_complete_publishes_canonical_text_before_tools_finish(self):
         begin, finish = threading.Event(), threading.Event()

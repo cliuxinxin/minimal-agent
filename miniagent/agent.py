@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import Callable, Literal
 from uuid import uuid4
 
+from .diagnostics import exception_diagnostic
 from .model import ChatModel
 from .tools import Tool, failure, tool_execution_context
 
@@ -83,6 +84,7 @@ class RunResult:
     steps: int
     tool_calls: int
     error: str | None = None
+    diagnostic: dict | None = None
 
 
 class Agent:
@@ -142,8 +144,8 @@ class Agent:
                 self.on_event({'run_id': run_id, 'event': event, 'step': steps,
                                'time': datetime.now(timezone.utc).isoformat(), 'data': data})
 
-        def finish(status, answer='', error=None):
-            result = RunResult(status, answer, steps, tool_calls, error)
+        def finish(status, answer='', error=None, diagnostic=None):
+            result = RunResult(status, answer, steps, tool_calls, error, diagnostic)
             emit('run_end', **asdict(result))
             return result
 
@@ -175,7 +177,8 @@ class Agent:
             except Exception as error:
                 if stopping():
                     return finish('cancelled')
-                return finish('model_error', error=f'Could not load registered tools: {error}'[:1000])
+                return finish('model_error', error=f'Could not load registered tools: {error}'[:1000],
+                              diagnostic=exception_diagnostic(error, phase='tool_registration'))
             steps += 1
             emit('model_start')
             if stopping():
@@ -194,7 +197,8 @@ class Agent:
             except Exception as error:
                 if stopping():
                     return finish('cancelled')
-                return finish('model_error', error=str(error)[:1000])
+                return finish('model_error', error=str(error)[:1000],
+                              diagnostic=exception_diagnostic(error, phase='model_request'))
             self.history.append(reply.message)
             emit('model_output', message=reply.message)
             emit('model_complete', text=reply.text, has_tool_calls=bool(reply.tool_calls))

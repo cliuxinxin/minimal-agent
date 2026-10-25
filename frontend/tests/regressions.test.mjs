@@ -43,6 +43,67 @@ test("streaming previews remain bounded and expose truncation notices", () => {
   assert.equal(Object.hasOwn(result.content[1], "result"), false, "preparing tools must not appear completed");
 });
 
+test("a model failure cannot fabricate a null result for a tool that never returned", () => {
+  const message = { role: "assistant", run_id: "run", status: "error", content: "", segments: [
+    { id: "search", type: "tool", name: "web_search", status: "error", arguments: '{"query":"test"}' },
+  ] };
+  const tool = convertMessage(message, 0, context(message, "Invalid model stream")).content[0];
+  assert.equal(Object.hasOwn(tool, "result"), false,
+    "missing tool output must stay absent so assistant-ui cannot infer successful completion");
+  assert.equal(tool.artifact.phase, "interrupted", "legacy errors without a tool result have unknown execution outcome");
+  assert.equal(tool.artifact.displayStatus.type, "incomplete");
+});
+
+test("terminal pending tools retain whether execution started", () => {
+  for (const [phase, expected] of [["preparing", "not_executed"], ["running", "interrupted"],
+    ["not_executed", "not_executed"], ["interrupted", "interrupted"]]) {
+    const message = { role: "assistant", run_id: "run", status: "error", content: "", segments: [
+      { id: "tool", type: "tool", name: "web_search", status: phase, arguments: "{}" },
+    ] };
+    const tool = convertMessage(message, 0, context(message)).content[0];
+    assert.equal(tool.artifact.phase, expected);
+    assert.equal(tool.artifact.displayStatus.type, "incomplete");
+    assert.equal(Object.hasOwn(tool, "result"), false);
+  }
+});
+
+test("actual tool errors remain errors even when the model later completes its answer", () => {
+  const error = { code: "search_error", message: "Search was unavailable" };
+  const message = { role: "assistant", run_id: "run", status: "completed", content: "Could not search", segments: [
+    { id: "tool", type: "tool", name: "web_search", status: "error", arguments: "{}", error },
+  ] };
+  const tool = convertMessage(message, 0, context(message)).content[0];
+  assert.equal(tool.artifact.phase, "error");
+  assert.deepEqual(tool.artifact.displayStatus, { type: "incomplete", reason: "error", error });
+  assert.equal(Object.hasOwn(tool, "result"), false, "an error is not a successful tool result");
+});
+
+test("real null results remain distinguishable from cancelled tools without results", () => {
+  const message = { role: "assistant", run_id: "run", status: "cancelled", content: "", segments: [
+    { id: "done", type: "tool", name: "run_python", status: "completed", arguments: "{}", result: null },
+    { id: "pending", type: "tool", name: "web_search", status: "preparing", arguments: "{}" },
+  ] };
+  const [done, pending] = convertMessage(message, 0, context(message)).content;
+  assert.equal(done.result, null);
+  assert.deepEqual(done.artifact.displayStatus, { type: "complete" });
+  assert.equal(Object.hasOwn(pending, "result"), false);
+  assert.equal(pending.artifact.phase, "not_executed");
+  assert.equal(pending.artifact.displayStatus.reason, "cancelled");
+});
+
+test("a failed message keeps its own diagnostic and error after another run starts", () => {
+  const diagnostic = { schema_version: 1, run_id: "failed-run", status: "error", step: 1,
+    connection: { provider: "openai", model: "test-model", endpoint: "https://example.com/v1", stream: true },
+    error: { type: "ModelError", message: "Invalid model stream", phase: "stream_parse", field: "choices[0].delta.tool_calls", actual_type: "object" },
+    events: [{ event: "model_error", step: 1, time: "2026-10-25T00:00:00Z" }] };
+  const message = { role: "assistant", run_id: "failed-run", status: "error", content: "", segments: [], diagnostic };
+  const result = convertMessage(message, 0, { sessionId: "session", messages: [message],
+    run: { id: "new-run", status: "running", step: 2, diagnostic: { run_id: "new-run" } } });
+  assert.deepEqual(result.metadata.custom.diagnostic, diagnostic);
+  assert.equal(result.status.error, "Invalid model stream");
+  assert.equal(result.metadata.custom.step, 1);
+});
+
 test("ambiguous multiple truncated final blocks retain order and offer the complete answer separately", () => {
   const message = { role: "assistant", run_id: "run", status: "completed", content: "first complete\nsecond completeTAIL", segments: [
     { id: "a", type: "text", step: 2, text: "first", truncated: true },
