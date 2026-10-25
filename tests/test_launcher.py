@@ -138,6 +138,23 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(response.requests, [(launcher.URL + '/api/health', 0.5)])
         self.browser.assert_not_called()
 
+    def test_registered_free_port_is_reused_after_default_port_was_occupied(self):
+        directory = self.root / 'data'
+        directory.mkdir()
+        (directory / 'server.json').write_text(json.dumps({'port': 39127}))
+        response = self.serve_health(self.current_health())
+        self.assertTrue(launcher.reopen_running_app())
+        self.browser.assert_called_once_with('http://127.0.0.1:39127')
+        self.assertEqual(response.requests, [('http://127.0.0.1:39127/api/health', .5)])
+
+    def test_untrusted_registry_cannot_redirect_probe_to_an_external_host(self):
+        directory = self.root / 'data'
+        directory.mkdir()
+        (directory / 'server.json').write_text(json.dumps({'port': 'https://external.example'}))
+        response = self.serve_health(self.current_health())
+        self.assertTrue(launcher.reopen_running_app())
+        self.assertEqual(response.requests, [(launcher.URL + '/api/health', .5)])
+
 
 if __name__ == '__main__':
     unittest.main()

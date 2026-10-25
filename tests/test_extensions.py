@@ -106,6 +106,11 @@ class ExtensionTests(unittest.TestCase):
         detail = self.state.new_session()
         session = self.state.get_session(detail['id'])
         class EventSource:
+            history = []
+            history_archive = []
+            context_summary = ''
+            compaction_count = 0
+
             def run(self, task, should_stop):
                 for step in range(150):
                     self.on_event({'event': 'tool_result', 'step': step,

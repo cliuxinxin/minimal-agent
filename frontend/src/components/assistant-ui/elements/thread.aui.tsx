@@ -27,6 +27,7 @@ import { CollapsibleRoot, CollapsibleTrigger, CollapsibleContent } from "./colla
 import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
 import type { ToolArtifact } from "@/message-adapter";
 import { DiagnosticDisclosure } from "./diagnostic-disclosure";
+import { WorkbenchOutput } from "./workbench-output";
 
 const groupBy = groupPartByType({ reasoning: ["group-reasoning"] });
 
@@ -75,6 +76,8 @@ function MessageState() {
   const step = Number(meta.step || 0);
   const statuses: Record<string, string> = {
     running: "运行中", stopping: "正在停止", completed: "已完成", cancelled: "已停止", error: "未完成",
+    interrupted: "已中断", step_limit: "已达调用上限", stalled: "已暂停",
+    running_elsewhere: "其他窗口运行中",
   };
   return (
     <div className="message-label">
@@ -89,7 +92,7 @@ function MessageState() {
 
 function MessageNotice() {
   const meta = useAuiState((s) => s.message.metadata.custom);
-  const incomplete = ["error", "cancelled"].includes(String(meta.uiStatus));
+  const incomplete = ["error", "cancelled", "interrupted", "step_limit", "stalled"].includes(String(meta.uiStatus));
   return (
     <>
       {Number(meta.segmentsOmitted) > 0 && (
@@ -97,7 +100,7 @@ function MessageNotice() {
       )}
       {incomplete && (
         <p className="message-outcome">
-          {meta.uiStatus === "cancelled" ? "任务已停止" : "任务未完成"}；以上已收到的内容予以保留，可能尚未完成。
+          {meta.uiStatus === "cancelled" ? "任务已停止" : meta.uiStatus === "interrupted" ? "任务已中断" : "任务未完成"}；以上已收到的内容予以保留。
         </p>
       )}
       <MessagePrimitive.Error>
@@ -190,6 +193,7 @@ function AssistantMessage() {
         </MessagePrimitive.GroupedParts>
         <FullAnswer />
         <MessageNotice />
+        <WorkbenchOutput />
         <DiagnosticDisclosure />
         <ActionBarPrimitive.Root hideWhenRunning autohide="not-last" className="aui-assistant-action-bar">
           <CopyAnswer />

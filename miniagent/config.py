@@ -33,13 +33,20 @@ def load_agent(path: str | Path = 'config.json', *, on_event=None, approve=None,
         fields = ', '.join('.'.join(map(str, e['loc'])) or 'JSON'
                            for e in error.errors(include_input=False, include_url=False))
         raise ValueError(f'配置格式不正确，请检查：{fields}。') from None
+    return build_agent(config, root=path.resolve().parent, on_event=on_event,
+                       approve=approve, workspace=workspace, stream=stream)
+
+
+def build_agent(config: _Config, *, root: Path, on_event=None, approve=None,
+                workspace: str | Path = 'workspace', stream: bool = False) -> Agent:
+    """Build from validated settings without writing credentials to a second file."""
     if not config.model.strip() or not config.api_key.get_secret_value().strip():
         raise ValueError('model 和 api_key 不能为空。')
     model_type = OpenAIModel if config.provider == 'openai' else AnthropicModel
     model = model_type(config.model, config.api_key.get_secret_value(), config.base_url)
     workspace = Path(workspace)
     workspace.mkdir(parents=True, exist_ok=True)
-    programming = ProgrammingTools(path.resolve().parent, workspace.resolve())
+    programming = ProgrammingTools(Path(root).resolve(), workspace.resolve())
     tools = build_tools(workspace) + programming.builtin_tools()
     if config.search_api_key and config.search_api_key.get_secret_value().strip():
         tools.extend(build_search_tools(config.search_api_key.get_secret_value()))

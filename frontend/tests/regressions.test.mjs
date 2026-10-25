@@ -239,3 +239,107 @@ test("unexpected metadata is omitted from safe runtime diagnostics", () => {
   assert.equal(report.checked_at, null);
   assert.doesNotMatch(JSON.stringify(report), /secret|private/);
 });
+
+test("restored interrupted messages remain incomplete and preserve received text", () => {
+  const message = { role: "assistant", run_id: "interrupted-run", status: "interrupted",
+    content: "已完成文件读取", segments: [{ id: "text", type: "text", text: "已完成文件读取" }] };
+  const result = convertMessage(message, 0, context(message));
+  assert.equal(result.status.type, "incomplete");
+  assert.equal(result.content[0].text, "已完成文件读取");
+  assert.equal(result.metadata.custom.uiStatus, "interrupted");
+});
+
+test("artifacts are attached to their answer and use validated same-origin routes", () => {
+  const id = "a".repeat(32);
+  const message = { role: "assistant", run_id: "run", status: "completed", content: "已完成", artifacts: [
+    { id, name: "monthly/report.csv", size: 12, change: "created", run_id: "run", created_at: "2026-10-25T10:00:00Z",
+      preview_url: `/api/artifacts/${id}`, download_url: `/api/artifacts/${id}/download` },
+    { id: "../config.json", name: "unsafe", size: 1 },
+    { id: "b".repeat(32), name: "evil.py", preview_url: "https://evil.example/file", download_url: "javascript:alert(1)" },
+  ] };
+  const result = convertMessage(message, 0, context(message));
+  assert.equal(result.metadata.custom.artifacts.length, 1);
+  assert.equal(result.metadata.custom.artifacts[0].download_url, `/api/artifacts/${id}/download`);
+  assert.equal(result.metadata.custom.artifacts[0].name, "monthly/report.csv");
+});
+
+test("source cards retain observed source IDs and reject unsafe or credential-bearing URLs", () => {
+  const message = { role: "assistant", run_id: "run", status: "completed", content: "见 [Sabc](https://example.com/a)", sources: [
+    { id: "Sabc", title: "来源", url: "https://example.com/a", date: "2026-10-24", read: true },
+    { id: "Sbad", title: "bad", url: "javascript:alert(1)", read: false },
+    { id: "Scredentials", title: "bad", url: "https://secret:token@example.com/a", read: false },
+    { id: "Sslashes", title: "bad", url: "https:\\evil.example", read: false },
+  ] };
+  const result = convertMessage(message, 0, context(message));
+  assert.equal(result.metadata.custom.sources.length, 1);
+  assert.equal(result.metadata.custom.sources[0].id, "Sabc");
+  assert.equal(result.metadata.custom.sources[0].read, true);
+});
+
+test("run metrics preserve unknown tokens and indicate partially reported usage", () => {
+  const message = { role: "assistant", run_id: "run", status: "completed", content: "ok", metrics: {
+    model_calls: 4, tool_calls: 2, input_tokens: 120, output_tokens: 30, total_tokens: 150,
+    known_usage_calls: 2, elapsed_seconds: 12.5, compactions: 1,
+  } };
+  const result = convertMessage(message, 0, context(message));
+  assert.equal(result.metadata.custom.metrics.total_tokens, 150);
+  assert.match(result.metadata.custom.metricsSummary, /部分用量/);
+  const unknown = convertMessage({ ...message, metrics: { model_calls: 2, tool_calls: 1,
+    known_usage_calls: 0, input_tokens: null, output_tokens: null, total_tokens: null,
+    elapsed_seconds: 3, compactions: 0 } }, 0, context(message));
+  assert.equal(unknown.metadata.custom.metrics.total_tokens, null);
+  assert.match(unknown.metadata.custom.metricsSummary, /用量未知/);
+});
+
+test("a previous answer keeps its metrics and sources when a new task is running", () => {
+  const message = { role: "assistant", run_id: "old", status: "completed", content: "old answer",
+    metrics: { model_calls: 1, tool_calls: 0, known_usage_calls: 0, elapsed_seconds: 2, compactions: 0 },
+    sources: [{ id: "Sold", title: "old source", url: "https://example.com/old", read: false }] };
+  const result = convertMessage(message, 0, { sessionId: "session", messages: [message], run: {
+    id: "new", status: "running", metrics: { model_calls: 99, tool_calls: 50, known_usage_calls: 0 } } });
+  assert.equal(result.metadata.custom.metrics.model_calls, 1);
+  assert.equal(result.metadata.custom.sources[0].id, "Sold");
+});
+
+test("invalid numeric usage cannot become misleading zero or negative totals", () => {
+  const message = { role: "assistant", run_id: "run", status: "completed", content: "ok", metrics: {
+    model_calls: 2, tool_calls: 0, input_tokens: -1, output_tokens: "2", total_tokens: NaN,
+    known_usage_calls: 0, elapsed_seconds: 1, compactions: 0,
+  } };
+  const result = convertMessage(message, 0, context(message));
+  assert.equal(result.metadata.custom.metrics.input_tokens, null);
+  assert.equal(result.metadata.custom.metrics.output_tokens, null);
+  assert.equal(result.metadata.custom.metrics.total_tokens, null);
+});
+
+test("a task running in another host is labeled separately without claiming tool interruption", () => {
+  const message = { role: "assistant", run_id: "external-run", status: "running", content: "", segments: [
+    { id: "tool", type: "tool", status: "running", name: "run_python", arguments: "{}" },
+  ] };
+  const result = convertMessage(message, 0, { sessionId: "session", messages: [message],
+    run: { id: "external-run", status: "running_elsewhere" } });
+  assert.equal(result.metadata.custom.uiStatus, "running_elsewhere");
+  assert.equal(result.content[0].artifact.phase, "running");
+  assert.equal(result.content[0].artifact.displayStatus.type, "running");
+  assert.equal(result.status.type, "incomplete");
+});
+
+test("unmatched source links are reported without inspecting fenced or inline code examples", () => {
+  const message = { role: "assistant", run_id: "sources", status: "completed", content:
+    "匹配 [Sgood](https://example.com/a)。\n" +
+    "不匹配 [Sgood](https://example.com/wrong) 和 [Sunknown](https://example.com/u)。\n" +
+    "```markdown\n[Sexample](https://example.com/example)\n```\n" +
+    "行内示例 `[Sinline](https://example.com/inline)`。\n" +
+    "~~~\n[Stilde](https://example.com/tilde)\n~~~",
+    sources: [{ id: "Sgood", title: "Source", url: "https://example.com/a", read: true }] };
+  const result = convertMessage(message, 0, context(message));
+  assert.deepEqual(result.metadata.custom.unmatchedSources, ["Sgood", "Sunknown"]);
+});
+
+test("source reference validation ignores ordinary links and accepts canonical URL spelling", () => {
+  const message = { role: "assistant", run_id: "sources", status: "completed", content:
+    "[Sgood](https://EXAMPLE.com/) 与 [普通链接](https://unrelated.example/)。",
+    sources: [{ id: "Sgood", title: "Source", url: "https://example.com", read: false }] };
+  const result = convertMessage(message, 0, context(message));
+  assert.deepEqual(result.metadata.custom.unmatchedSources, []);
+});

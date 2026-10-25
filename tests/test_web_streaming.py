@@ -17,6 +17,10 @@ class EventSource:
     def __init__(self, program):
         self.program = program
         self.calls = 0
+        self.history = []
+        self.history_archive = []
+        self.context_summary = ''
+        self.compaction_count = 0
 
     def run(self, task, *, should_stop):
         self.calls += 1

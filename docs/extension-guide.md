@@ -12,7 +12,7 @@ result = agent.run("读取 products.md 并列出价格")
 print(result.status, result.answer)
 ```
 
-同一会话复用一个实例；`agent.history` 保留进程内历史，`agent.reset()` 清空历史。网页也为每个会话创建一个独立 Agent。网页与 CLI 的 JSONL 日志用于观察，不承担自动恢复或长期记忆。
+同一会话复用一个实例；`agent.history` 是当前模型请求历史，`history_archive` 保留未压缩的原始历史，`context_summary` 与 `compaction_count` 保存工作摘要状态。`agent.reset()` 清空这些状态。网页通过本地 SQLite 恢复它们；CLI 的持久化仍由调用者决定。JSONL 日志用于观察。
 
 ## 通过对话创建工具
 
@@ -102,7 +102,7 @@ agent = Agent(model, build_tools(Path("workspace")), max_steps=80)
 
 ## 观察和核验
 
-`run()` 返回 `RunResult`，状态为 `completed`、`step_limit`、`model_error`、`cancelled` 或 `stalled`，另含 `answer`、`steps`、`tool_calls`、`error` 和可选 `diagnostic`。新增字段有默认值，原有调用方式继续有效。判断状态后再使用答案；模型结束不等于业务结果正确。`on_event` 可接收运行事件，网页与 CLI 将事件写入 `./runs/*.jsonl`；任务、模型文本和工具结果可能包含业务内容。
+`run()` 返回 `RunResult`，状态为 `completed`、`step_limit`、`model_error`、`cancelled` 或 `stalled`，另含 `answer`、`steps`、`tool_calls`、`error`，以及可选的 `diagnostic` 和 `metrics`。新增字段有默认值，原有调用方式继续有效。判断状态后再使用答案；模型结束不等于业务结果正确。`on_event` 可接收运行事件，网页与 CLI 将事件写入 `./runs/*.jsonl`；任务、模型文本和工具结果可能包含业务内容。
 
 后台线程可以用 `agent.run(task, should_stop=stop_event.is_set)` 协作式停止。检查发生在模型调用前、回复后和工具之间；流式模型传输会主动关闭正在等待数据的连接。非流式请求、搜索及一般同步 handler 会等到返回或超时。编程工具通过 `miniagent.tools.execution_stopped()` 获取取消状态并终止子进程；你也可以在自定义长任务中检查这个函数。已经完整接收的工具调用会收到对应的 `cancelled` 错误结果；未完整接收的模型回复不加入原生历史，也不执行工具。
 
@@ -168,6 +168,26 @@ result = agent.run("读取 products.md 并总结")
 
 每轮新任务开始时释放前一轮的重放缓存，保持会话序号递增；旧轮游标强制获得新快照。终态 `message.content` 保留完整最终答案，前端可据此恢复最终文字，或在无法可靠还原多段边界时提供完整原文与复制入口。运行中的预览限制不应造成最终答案静默丢失。停止请求的异步响应同时核对会话、版本和运行 ID，避免旧请求影响新任务。
 
-聊天状态目前只在进程内保存，配置、上传文件、生成工具与日志保存在磁盘。要增加长期会话，优先在服务端为原生 `agent.history` 和页面消息分别实现持久化，并确保加载时仍匹配创建会话所用的提供商。
+## v0.5.0 本地工作台接口
+
+`miniagent/persistence.py` 用 SQLite 事务保存页面消息和四个 Agent 状态字段。配置快照只包含 provider/model/base_url/max_steps/search_enabled，不包含凭据。恢复时先检查同一提供商和 endpoint，再从当前配置取得密钥。未配对的原生工具调用补上 `interrupted_unknown_outcome` 结果，绝不据此自动执行工具。接收任务到工作线程启动之间用 `pending_task` 保存目标；原生 user 检查点提交后清除。每份会话有递增 revision，过期进程的保存会被拒绝。
+
+| 接口 | 行为 |
+| --- | --- |
+| `POST /api/check-connection` | `{target:'model'或'search', config:{设置字段}}`；按需验证草稿设置，返回 checks；不保存配置、不创建会话 |
+| `POST /api/sessions/{id}/continue` | `{}`；用户请求继续中断／失败／已停止的任务 |
+| `GET /api/artifacts/{id}` | 返回快照元信息、文本预览、可选 CSV 表格及 diff |
+| `GET /api/artifacts/{id}/download` | 以附件返回已归档的固定字节，不读取任意工作区路径 |
+| `POST /api/tools/{name}/enabled` | `{enabled:bool}`；下次动态工具刷新生效 |
+| `POST /api/tools/{name}/rollback` | `{}`；交换当前与上一版本，保留启停状态，不执行代码 |
+| `POST /api/tools/{name}/test` | `{}`；在锁外测试所读取的固定版本，返回 version/total/results/passed |
+
+assistant 消息可包含 `artifacts`、`sources`、`metrics`。来源由实际搜索／抓取结果产生：`{id,title,url,date,read}`；模型使用 `[source_id](真实URL)`。UI 校验 ID 与 URL 是否匹配，排除代码中的引用示例，不把链接匹配视为事实证明。抓取缓存使用 `execution_run_id()` 区分任务，跨任务不复用。
+
+`ModelReply.usage` 是可选的归一化 input_tokens/output_tokens/total_tokens；`RunResult.metrics` 汇总实际已观测用量、known_usage_calls、模型／工具次数、时间和压缩次数。OpenAI 仅对官方 HTTPS 域请求 include_usage，其他兼容接口只消费实际返回的 usage；Anthropic 合并消息起始和累计输出用量。缺失字段保持 `None`，不伪造精确用量或费用。
+
+`checkpoint` 是内部事件，不把原生历史放进 SSE；宿主在这个边界读取 Agent 状态并持久化。`usage` 和 `context_compaction` 提供可显示的状态。`run_status` 额外带 metrics/phase/last_activity_at/finished_at/storage_warning。前端仍不执行任何模型工具。
+
+create_tool 保留原有 example_arguments/expected_result，新增可选 `tests`（最多 20 组附加样例）与 `input_schema`。支持对象字段、required/additionalProperties、数组 items、基本类型、enum、字符串／数组／数值边界；不支持的 schema 关键字会拒绝。所有样例通过后才发布新版本。单样例通过只证明该样例，不代表程序全面正确。
 
 运行 `python -m unittest discover -s tests -v` 检查程序边界。新增工具需验证正常输入、错误输入，以及写工具审批拒绝时不执行；模型替身只留在测试里。再用配置的真实模型核对工具轨迹和可独立计算的预期结果。交付未使用你的凭据完成真实 API 联调。

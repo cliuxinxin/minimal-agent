@@ -1,7 +1,7 @@
 {
   "name": "minimal-agent-chat-ui",
   "private": true,
-  "version": "0.4.2",
+  "version": "0.5.0",
   "type": "module",
   "scripts": {
     "build": "node build.mjs",
@@ -21,7 +21,9 @@
     "@base-ui/react": "1.9.0",
     "@assistant-ui/react-syntax-highlighter": "0.14.7",
     "react-syntax-highlighter": "16.1.2",
-    "remend": "1.4.0"
+    "remend": "1.4.0",
+    "unified": "11.0.5",
+    "remark-parse": "11.0.0"
   },
   "devDependencies": {
     "esbuild": "0.28.2",

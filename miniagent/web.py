@@ -6,13 +6,17 @@ from collections import deque
 import copy
 from datetime import datetime, timezone
 import errno
+import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import re
+import sqlite3
 import tempfile
 import threading
-from urllib.parse import parse_qs, urlsplit
+import time
+from urllib.parse import parse_qs, quote, urlsplit
 from uuid import uuid4
 import webbrowser
 
@@ -20,10 +24,12 @@ from pydantic import ValidationError
 
 from . import __version__
 from .builtin_tools import build_tools
-from .config import _Config, load_agent
+from .config import _Config, build_agent, load_agent
+from .connection_check import check_connection as run_connection_check
 from .diagnostics import diagnostic_fields, exception_diagnostic, write_diagnostic
 from .model import AnthropicModel, OpenAIModel
 from .programming import ProgrammingTools
+from .persistence import SessionConflict, SessionStore, repair_history
 from .runtime import runtime_identity
 from .search import build_search_tools
 from .tracing import JsonlTrace
@@ -50,6 +56,37 @@ class RequestError(Exception):
 
 def now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def process_alive(pid):
+    if type(pid) is not int or pid <= 0:
+        return False
+    if os.name == 'nt':
+        # os.kill(pid, 0) is destructive on Windows; query the process instead.
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel.CloseHandle.restype = wintypes.BOOL
+        handle = kernel.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return ctypes.get_last_error() == 5
+        try:
+            code = wintypes.DWORD()
+            return not kernel.GetExitCodeProcess(handle, ctypes.byref(code)) or code.value == 259
+        finally:
+            kernel.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
 
 
 def unique_object(pairs):
@@ -135,6 +172,49 @@ class RunPresentation:
         self.trace_error = None
         self.channels, self.identities, self.text_lengths, self.omitted_text_lengths = {}, {}, {}, {}
         self.counter = 0
+        self.artifact_before = None
+
+    def collect_sources(self, name, result):
+        if name not in {'web_search', 'fetch_webpage'} or not isinstance(result, dict):
+            return False
+        from .search import _valid_url
+        items = result.get('results', []) if name == 'web_search' else [result]
+        if not isinstance(items, list):
+            return False
+        sources = self.message.setdefault('sources', [])
+        changed = False
+        for item in items:
+            if not isinstance(item, dict) or not _valid_url(item.get('url')):
+                continue
+            url = item['url']
+            source_id = item.get('source_id')
+            if not isinstance(source_id, str) or not re.fullmatch(r'S[a-fA-F0-9]{6,64}', source_id):
+                source_id = 'S' + hashlib.sha256(url.encode()).hexdigest()[:12]
+            previous = next((source for source in sources if source['url'] == url), None)
+            source = {'id': previous['id'] if previous else source_id,
+                      'title': item.get('title', url)[:300] if isinstance(item.get('title', url), str) else url,
+                      'url': url, 'date': item.get('date') if isinstance(item.get('date'), str) else None,
+                      'read': name == 'fetch_webpage'}
+            if previous:
+                source['read'] = previous.get('read', False) or source['read']
+                source['date'] = source['date'] or previous.get('date')
+                previous.update(source)
+            else:
+                sources.append(source)
+            changed = True
+        return changed
+
+    def capture_artifacts(self):
+        if self.artifact_before is None or not getattr(self.state, 'artifacts', None):
+            return False
+        before, self.artifact_before = self.artifact_before, None
+        try:
+            artifacts = self.state.artifacts.capture(before, run_id=self.run['id'])
+            self.message.setdefault('artifacts', []).extend(artifacts)
+            return bool(artifacts)
+        except (OSError, ValueError):
+            self.message['artifact_warning'] = '工作文件仍在本机，但本次成果快照保存失败。请检查磁盘空间和目录权限。'
+            return True
 
     def log(self, event):
         if self.trace_error is not None:
@@ -283,8 +363,16 @@ class RunPresentation:
         with self.state.lock:
             kind = event.get('event')
             self.run['step'] = event.get('step', self.run['step'])
+            self.run['last_activity_at'] = now()
+            if kind == 'checkpoint':
+                if event.get('data', {}).get('reason') == 'user':
+                    self.session.pop('pending_task', None)
+                self.state.checkpoint(self.session)
+                return
             if kind in DELTA_EVENTS:
                 self.delta(event)
+                self.run['phase'] = 'generating'
+                self.state.checkpoint(self.session, throttled=True)
                 return
             if kind in {'model_complete', 'run_end'}:
                 self.flush(event.get('step') if kind == 'model_complete' else None)
@@ -295,12 +383,26 @@ class RunPresentation:
                 return  # Native signed/encrypted blocks belong only in local history/logs.
             displayed = browser_event(safe)
             data, step = displayed.get('data', {}), self.run['step']
-            if kind == 'model_complete':
+            if kind == 'usage':
+                self.run['metrics'] = self.message['metrics'] = safe.get('data', {})
+                self.state.publish_status(self.session, self.run)
+            elif kind == 'context_compaction':
+                self.run['phase'] = 'compacting' if data.get('status') == 'start' else 'working'
+                self.state.publish_status(self.session, self.run)
+            elif kind == 'model_start':
+                self.run['phase'] = 'compacting' if data.get('purpose') == 'context_compaction' else 'waiting_model'
+            elif kind == 'model_complete':
                 self.canonical_text(step, safe.get('data', {}).get('text', ''), publish=True)
             elif kind in {'tool_call', 'tool_result'}:
                 segment = self.segment('tool', step, call_id=data.get('id', ''), name=data.get('name', ''))
                 segment.update(call_id=data.get('id', segment['call_id']), name=data.get('name', segment['name']))
                 if kind == 'tool_call':
+                    self.run['phase'] = 'running_tool'
+                    if data.get('name') not in {'list_files', 'read_file', 'web_search', 'fetch_webpage'}:
+                        try:
+                            self.artifact_before = self.state.artifacts.scan() if self.state.artifacts else None
+                        except (OSError, ValueError):
+                            self.artifact_before = None
                     arguments = safe.get('data', {}).get('arguments', '')
                     segment.update(status='running', arguments=arguments[:TRACE_PREVIEW_LIMIT])
                     if len(arguments) > TRACE_PREVIEW_LIMIT:
@@ -315,7 +417,12 @@ class RunPresentation:
                         segment['result'] = data['result']
                     if error is not None:
                         segment['error'] = error
+                    source_changed = self.collect_sources(data.get('name'), safe.get('data', {}).get('result'))
+                    artifacts_changed = self.capture_artifacts()
+                    if source_changed or artifacts_changed:
+                        self.state.publish(self.session, 'snapshot', {'session': self.session['detail']})
                 self.publish_segment(segment)
+                self.state.publish_status(self.session, self.run)
             self.run['events'].append(displayed)
             self.run['event_count'] += 1
             excess = len(self.run['events']) - TRACE_EVENT_LIMIT
@@ -338,6 +445,160 @@ class WebState:
         self.workspace.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
         self.sessions = {}
+        from .artifacts import ArtifactStore
+        self.artifacts = None
+        try:
+            self.artifacts = ArtifactStore(self.root, self.workspace)
+        except (OSError, ValueError):
+            pass
+        self.check_lock = threading.Lock()
+        self.storage_warning = None
+        self.store = None
+        try:
+            self.store = SessionStore(self.root)
+            self.restore_sessions()
+        except (OSError, ValueError, sqlite3.Error):
+            self.storage_warning = '本地会话存储暂不可用；本次对话可能无法在重启后恢复。请检查磁盘和目录权限。'
+
+    def checkpoint(self, session, *, throttled=False):
+        timestamp = time.monotonic()
+        if throttled and timestamp - session.get('last_checkpoint', 0) < 1:
+            return True
+        session['last_checkpoint'] = timestamp
+        if not self.store:
+            session['detail']['storage_warning'] = self.storage_warning
+            return True
+        agent = session.get('agent')
+        record = {
+            'detail': session['detail'], 'settings': session['settings'],
+            'history': agent.history if agent else session.get('saved_history', []),
+            'history_archive': getattr(agent, 'history_archive', agent.history) if agent else session.get('saved_archive', []),
+            'context_summary': getattr(agent, 'context_summary', '') if agent else session.get('saved_summary', ''),
+            'compaction_count': getattr(agent, 'compaction_count', 0) if agent else session.get('saved_compactions', 0),
+            'revision': session.get('store_revision', 0), 'owner_pid': os.getpid(),
+            'pending_task': session.get('pending_task'),
+        }
+        try:
+            session['store_revision'] = self.store.save(record)
+            session['detail'].pop('storage_warning', None)
+        except SessionConflict:
+            session['detail'].update(resume_available=False,
+                resume_reason='另一个后台已更新此会话；请关闭旧启动窗口，在最新页面重新打开对话。')
+            session['detail']['storage_warning'] = session['detail']['resume_reason']
+            if session.get('stop'):
+                session['stop'].set()
+            return False
+        except (OSError, ValueError, TypeError, sqlite3.Error):
+            session['detail']['storage_warning'] = '会话保存失败，当前结果仍可查看；关闭前请检查磁盘空间和目录权限。'
+        return True
+
+    def restore_sessions(self, records=None):
+        for record in self.store.load() if records is None else records:
+            try:
+                detail, settings = record['detail'], record['settings']
+                detail.update(restored=True, resume_available=False, resume_reason=None)
+                run = detail.get('run')
+                external = bool(run and run.get('status') in ACTIVE and record.get('owner_pid') != os.getpid()
+                                and process_alive(record.get('owner_pid')))
+                if external:
+                    history, archive, repaired = record['history'], record.get('history_archive', record['history']), []
+                    run['status'] = 'running_elsewhere'
+                else:
+                    history, repaired = repair_history(record['history'], settings['provider'])
+                    archive, _ = repair_history(record.get('history_archive', record['history']), settings['provider'])
+                    pending = record.get('pending_task')
+                    if isinstance(pending, dict) and isinstance(pending.get('text'), str) and pending['text'].strip():
+                        # Acceptance was durable before the worker could append its native user turn.
+                        if len(record['history']) <= pending.get('history_length', -1):
+                            history.append({'role': 'user', 'content': pending['text']})
+                        if len(record.get('history_archive', record['history'])) <= pending.get('archive_length', -1):
+                            archive.append({'role': 'user', 'content': pending['text']})
+                if run and run.get('status') in ACTIVE and not external:
+                    run.update(status='interrupted', error='上次运行因后台退出而中断，请检查已完成步骤后继续。',
+                               finished_at=now())
+                    for message in detail['messages']:
+                        if message.get('run_id') != run['id'] or message.get('role') != 'assistant':
+                            continue
+                        message['status'] = 'interrupted'
+                        for segment in message.get('segments', []):
+                            if segment.get('type') == 'tool' and segment.get('status') in {'running', 'preparing'}:
+                                segment['status'] = 'interrupted'
+                                segment['error'] = {'code': 'interrupted_unknown_outcome',
+                                                    'message': '后台退出前没有记录执行结果，请先检查已有产物。'}
+                if repaired:
+                    detail['recovery_notice'] = '部分工具结果未知；继续时会先检查已有文件，不自动重放之前的工具。'
+                session = {'detail': detail, 'settings': settings, 'agent': None,
+                           'external_active': external,
+                           'saved_history': history, 'saved_archive': archive,
+                           'saved_summary': record.get('context_summary', ''),
+                           'saved_compactions': record.get('compaction_count', 0),
+                           'store_revision': record.get('revision', 0),
+                           'runtime': dict(self.runtime), 'endpoint': '', 'secret': [], 'stop': None,
+                           'sequence': 0, 'run_sequence': 0, 'journal': deque(maxlen=SSE_JOURNAL_LIMIT),
+                           'changed': threading.Condition(self.lock)}
+                self.sessions[detail['id']] = session
+                self.restore_agent(session)
+                if not external:
+                    self.checkpoint(session)
+            except (ValueError, TypeError, KeyError, OSError):
+                self.storage_warning = '部分本地会话无法恢复，原始记录已保留。'
+        if self.store.warnings:
+            self.storage_warning = self.store.warnings[0]
+
+    def restore_agent(self, session):
+        if session.get('external_active'):
+            session['detail'].update(resume_available=False,
+                resume_reason='该任务仍在另一个启动窗口运行。请等待任务结束并关闭旧后台，再重新打开当前应用。')
+            return
+        if session.get('agent') is not None:
+            return
+        detail, saved, current = session['detail'], session['settings'], self.read_config()
+        try:
+            if current is None or saved['provider'] != current.provider:
+                raise ValueError
+            candidate = _Config.model_validate({
+                **{key: saved[key] for key in ('provider', 'model', 'base_url', 'max_steps') if key in saved},
+                'api_key': current.api_key.get_secret_value(),
+                'search_api_key': (current.search_api_key.get_secret_value()
+                                   if saved.get('search_enabled') and current.search_api_key else None),
+            })
+            if self.model(candidate).endpoint != self.model(current).endpoint:
+                raise ValueError
+            agent = build_agent(candidate, root=self.root, workspace=self.workspace, stream=True)
+            agent.history = copy.deepcopy(session['saved_history'])
+            agent.history_archive = copy.deepcopy(session['saved_archive'])
+            agent.context_summary = session['saved_summary']
+            agent.compaction_count = session['saved_compactions']
+            session.update(agent=agent, endpoint=self.model(candidate).endpoint,
+                           secret=[candidate.api_key.get_secret_value(),
+                                   candidate.search_api_key.get_secret_value() if candidate.search_api_key else ''])
+            detail.update(resume_available=True, resume_reason=None,
+                          search_enabled=bool(candidate.search_api_key))
+        except (ValueError, OSError):
+            detail.update(resume_available=False,
+                          resume_reason='请在模型设置中恢复该对话原来的服务商和接口地址，并填写有效密钥；当前仍可查看历史。')
+
+    def check_connection(self, data):
+        if set(data) != {'target', 'config'} or data.get('target') not in {'model', 'search'} or not isinstance(data.get('config'), dict):
+            raise RequestError(400, '连接检查参数无效。')
+        with self.lock:
+            if data['target'] == 'search':
+                key = data['config'].get('search_api_key', '')
+                if key is not None and not isinstance(key, str):
+                    raise RequestError(400, '搜索密钥必须为文本。')
+                current = self.read_config()
+                if key == '' and current and current.search_api_key:
+                    key = current.search_api_key.get_secret_value()
+                model, search_key = None, key.strip() if isinstance(key, str) else None
+            else:
+                config = self.candidate_config(data['config'])
+                model, search_key = self.model(config), None
+        if not self.check_lock.acquire(blocking=False):
+            raise RequestError(409, '已有连接检查正在进行，请稍后重试。')
+        try:
+            return run_connection_check(model, target=data['target'], search_key=search_key)
+        finally:
+            self.check_lock.release()
 
     def read_config(self):
         try:
@@ -368,7 +629,7 @@ class WebState:
                                            config.search_api_key.get_secret_value().strip()),
                 'configured': valid}
 
-    def save_config(self, data):
+    def candidate_config(self, data):
         if set(data) - {'provider', 'model', 'api_key', 'base_url', 'max_steps', 'search_api_key'}:
             raise RequestError(400, '配置中包含不支持的字段。')
         old = self.read_config()
@@ -402,6 +663,10 @@ class WebState:
                 build_search_tools(config.search_api_key.get_secret_value())
         except (ValidationError, ValueError):
             raise RequestError(400, '配置无效，请检查模型设置、密钥和调用次数上限。') from None
+        return config
+
+    def save_config(self, data):
+        config = self.candidate_config(data)
         stored = config.model_dump(exclude={'api_key', 'search_api_key'})
         stored['api_key'] = config.api_key.get_secret_value()
         stored['search_api_key'] = config.search_api_key.get_secret_value() if config.search_api_key else None
@@ -415,6 +680,8 @@ class WebState:
             os.replace(filename, self.root / 'config.json')
         finally:
             Path(filename).unlink(missing_ok=True)
+        for session in self.sessions.values():
+            self.restore_agent(session)
         return self.masked_config()
 
     def tool_inventory(self):
@@ -428,10 +695,29 @@ class WebState:
                 'saved_tools': saved, 'tool_errors': programming.errors()}
 
     def files(self):
-        return [{'name': path.name, 'size': path.stat().st_size}
-                for path in sorted(self.workspace.iterdir())
-                if path.suffix.lower() in EXTENSIONS and path.is_file()
-                and not path.is_symlink() and not path.name.startswith('.')]
+        if self.artifacts is None:
+            return [{'name': path.name, 'size': path.stat().st_size}
+                    for path in sorted(self.workspace.iterdir())
+                    if path.suffix.lower() in EXTENSIONS and path.is_file()
+                    and not path.is_symlink() and not path.name.startswith('.')]
+        known = {}
+        for session in sorted(self.sessions.values(), key=lambda item: item['detail']['updated_at'], reverse=True):
+            for message in reversed(session['detail']['messages']):
+                for artifact in reversed(message.get('artifacts', [])):
+                    known.setdefault(artifact['name'], artifact)
+        files = []
+        for name, snapshot in sorted(self.artifacts.scan().items()):
+            item = {'name': name, 'size': snapshot['size']}
+            artifact = known.get(name)
+            if artifact:
+                try:
+                    metadata, raw = self.artifacts.get(artifact['id'])
+                    if hashlib.sha256(raw).hexdigest() == snapshot['sha256']:
+                        item['artifact'] = metadata
+                except (OSError, ValueError):
+                    pass
+            files.append(item)
+        return files
 
     def upload(self, data):
         name, content = data.get('name'), data.get('content')
@@ -477,8 +763,11 @@ class WebState:
         detail = {'id': sid, 'title': '新对话', 'provider': config.provider, 'model': config.model,
                   'max_steps': config.max_steps, 'search_enabled': bool(config.search_api_key and
                       config.search_api_key.get_secret_value().strip()),
-                  'created_at': timestamp, 'updated_at': timestamp, 'messages': [], 'run': None}
+                  'created_at': timestamp, 'updated_at': timestamp, 'messages': [], 'run': None,
+                  'resume_available': True, 'resume_reason': None, 'restored': False}
         self.sessions[sid] = {'detail': detail, 'agent': agent,
+                              'settings': {**config.model_dump(exclude={'api_key', 'search_api_key'}),
+                                           'search_enabled': detail['search_enabled']},
                               'runtime': dict(self.runtime),
                               'endpoint': self.model(config).endpoint,
                               'secret': [config.api_key.get_secret_value(),
@@ -486,11 +775,19 @@ class WebState:
                               'stop': None, 'sequence': 0, 'run_sequence': 0,
                               'journal': deque(maxlen=SSE_JOURNAL_LIMIT),
                               'changed': threading.Condition(self.lock)}
+        self.checkpoint(self.sessions[sid])
         return detail
 
     def get_session(self, sid):
         if sid not in self.sessions:
             raise RequestError(404, '未找到该对话。')
+        if self.sessions[sid].get('external_active') and self.store:
+            try:
+                record = next((item for item in self.store.load() if item['detail']['id'] == sid), None)
+                if record:
+                    self.restore_sessions([record])
+            except (OSError, ValueError, sqlite3.Error):
+                self.sessions[sid]['detail']['storage_warning'] = '无法刷新其他后台的任务状态，请稍后重试。'
         return self.sessions[sid]
 
     def summaries(self):
@@ -511,7 +808,9 @@ class WebState:
 
     def publish_status(self, session, run):
         self.publish(session, 'run_status', {'run_id': run['id'], **{
-            key: run[key] for key in ('status', 'step', 'error', 'event_count', 'omitted_events')}})
+            key: run[key] for key in ('status', 'step', 'error', 'event_count', 'omitted_events',
+                                     'metrics', 'phase', 'last_activity_at', 'finished_at') if key in run},
+            'storage_warning': session['detail'].get('storage_warning')})
 
     @staticmethod
     def assistant_message(session, run):
@@ -519,7 +818,7 @@ class WebState:
             if message.get('role') == 'assistant' and message.get('run_id') == run['id']:
                 return message
         message = {'role': 'assistant', 'run_id': run['id'], 'content': '', 'status': 'running',
-                   'segments': [], 'segments_omitted': 0}
+                   'segments': [], 'segments_omitted': 0, 'artifacts': [], 'sources': []}
         session['detail']['messages'].append(message)
         return message
 
@@ -537,13 +836,21 @@ class WebState:
         message = data.get('message')
         if set(data) != {'message'} or not isinstance(message, str) or not message.strip() or len(message) > 60000:
             raise RequestError(400, '消息必须为 1–60000 字符的非空文本。')
+        if session.get('external_active'):
+            session = self.get_session(session['detail']['id'])
         detail = session['detail']
         if detail['run'] and detail['run']['status'] in ACTIVE:
             raise RequestError(409, '该对话仍在运行，请等待或停止。')
+        self.restore_agent(session)
+        if not detail.get('resume_available', True) or session.get('agent') is None:
+            raise RequestError(409, detail.get('resume_reason') or '请先恢复模型配置。')
+        previous_detail = copy.deepcopy(detail)
         run = {'id': uuid4().hex, 'status': 'running', 'step': 0, 'error': None, 'events': [],
-               'started_at': now(),
+               'started_at': now(), 'last_activity_at': now(), 'phase': 'preparing',
                'event_count': 0, 'omitted_events': 0}
         session['stop'] = threading.Event()
+        session['pending_task'] = {'text': message, 'history_length': len(session['agent'].history),
+                                   'archive_length': len(getattr(session['agent'], 'history_archive', session['agent'].history))}
         detail['run'] = run
         if not detail['messages']:
             detail['title'] = redact(message.strip(), session['secret'])[:28]
@@ -554,6 +861,11 @@ class WebState:
         # containing the new user/assistant pair, even at the adjacent sequence.
         session['journal'].clear()
         session['run_sequence'] = session['sequence'] + 1
+        if not self.checkpoint(session):
+            reason = detail['resume_reason']
+            detail.clear()
+            detail.update(previous_detail, resume_available=False, resume_reason=reason, storage_warning=reason)
+            raise RequestError(409, reason)
         self.publish_status(session, run)
         threading.Thread(target=self.work, args=(session, message, run), daemon=True).start()
         return {'session_id': detail['id'], 'run_id': run['id']}
@@ -571,11 +883,14 @@ class WebState:
             error = redact(result.error, session['secret'])
             answer = redact(result.answer, session['secret'])
             diagnostic = diagnostic_fields(getattr(result, 'diagnostic', None))
+            metrics = getattr(result, 'metrics', None)
         except Exception as failure:
             status, error, answer = 'error', '运行遇到内部错误，请检查配置后重试。', ''
             diagnostic = exception_diagnostic(failure, phase='host_run')
+            metrics = None
         with self.lock:
             presentation.flush()
+            presentation.capture_artifacts()
             if status == 'completed':
                 presentation.canonical_text(run['step'], answer)
                 content = answer
@@ -593,7 +908,9 @@ class WebState:
                                     '运行已中断，尚未收到工具执行结果。'),
                     }
                     presentation.publish_segment(segment)
-            run.update(status=status, error=error)
+            run.update(status=status, error=error, phase=status, finished_at=now())
+            if metrics:
+                run['metrics'] = assistant['metrics'] = redact(metrics, session['secret'])
             assistant.update(content=content, status=status)
             session['detail']['updated_at'] = now()
             if status == 'error':
@@ -605,6 +922,7 @@ class WebState:
                     report['diagnostic_file'] = None
                     report['storage_error'] = type(failure).__name__
                 run['diagnostic'] = assistant['diagnostic'] = report
+            self.checkpoint(session)
             self.publish_status(session, run)
             self.publish(session, 'snapshot', {'session': session['detail']})
 
@@ -662,6 +980,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Cache-Control', 'no-store')
         self.send_header('X-Content-Type-Options', 'nosniff')
         self.send_header('Content-Security-Policy', "default-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'")
+        if getattr(self, 'attachment_name', None):
+            self.send_header('Content-Disposition', "attachment; filename=artifact.txt; filename*=UTF-8''"
+                             + quote(self.attachment_name, safe=''))
         self.end_headers()
         self.wfile.write(raw)
 
@@ -702,6 +1023,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_request(self, method):
         self.streaming_started = False
+        self.attachment_name = None
         try:
             self.check_headers()
             path = urlsplit(self.path).path
@@ -709,6 +1031,22 @@ class Handler(BaseHTTPRequestHandler):
                 self.stream_events(path.split('/')[3])
                 return
             data = self.read_body() if method == 'POST' else None
+            # Network checks and Python test suites must not hold the host lock.
+            if method == 'POST' and path == '/api/check-connection':
+                self.send(200, self.server.state.check_connection(data))
+                return
+            if method == 'POST' and re.fullmatch(r'/api/tools/[A-Za-z_][A-Za-z0-9_]{0,63}/test', path):
+                if data:
+                    raise RequestError(400, '运行测试不接受额外字段。')
+                state = self.server.state
+                try:
+                    result = ProgrammingTools(state.root, state.workspace).test_saved(path.split('/')[3])
+                    with state.lock:
+                        payload = {'result': result, **state.tool_inventory()}
+                except (ValueError, FileNotFoundError) as error:
+                    raise RequestError(400, '无法运行该工具的测试，请刷新工具列表。') from error
+                self.send(200, payload)
+                return
             with self.server.state.lock:
                 status, payload, mime = self.route(method, path, data)
                 payload = copy.deepcopy(payload)
@@ -794,13 +1132,27 @@ class Handler(BaseHTTPRequestHandler):
                 result = {'config': state.masked_config()}
                 if path == '/api/bootstrap':
                     result.update(runtime=state.runtime, sessions=state.summaries(),
-                                  files=state.files(), **state.tool_inventory())
+                                  files=state.files(), storage_warning=state.storage_warning, **state.tool_inventory())
             elif path == '/api/tools':
                 result = state.tool_inventory()
             elif path == '/api/sessions':
                 result = {'sessions': state.summaries()}
             elif path == '/api/files':
                 result = {'files': state.files()}
+            elif re.fullmatch(r'/api/artifacts/[a-f0-9]{32}(?:/download)?', path):
+                if state.artifacts is None:
+                    raise RequestError(503, '成果存储暂不可用，请检查本机目录权限。')
+                artifact_id = path.split('/')[3]
+                try:
+                    if path.endswith('/download'):
+                        metadata, content = state.artifacts.get(artifact_id)
+                        self.attachment_name = metadata['name'].rsplit('/', 1)[-1]
+                        return 200, content, 'application/octet-stream'
+                    result = state.artifacts.preview(artifact_id)
+                except FileNotFoundError:
+                    raise RequestError(404, '该成果文件已不存在。') from None
+                except (ValueError, OSError):
+                    raise RequestError(400, '无法读取该成果文件。') from None
             elif path.startswith('/api/sessions/') and path.count('/') == 3:
                 result = {'session': state.get_session(path.rsplit('/', 1)[-1])['detail']}
             elif path in {'/', '/index.html', '/app.js', '/style.css', '/assets/chat.js', '/assets/chat.css'}:
@@ -819,11 +1171,33 @@ class Handler(BaseHTTPRequestHandler):
                 if data:
                     raise RequestError(400, '创建对话不接受额外字段。')
                 status, result = 201, {'session': state.new_session()}
+            elif re.fullmatch(r'/api/tools/[A-Za-z_][A-Za-z0-9_]{0,63}/(enabled|rollback)', path):
+                name, action = path.split('/')[3:]
+                programming = ProgrammingTools(state.root, state.workspace)
+                try:
+                    if action == 'enabled':
+                        if set(data) != {'enabled'} or type(data['enabled']) is not bool:
+                            raise RequestError(400, '启停参数必须是布尔值。')
+                        tool = programming.set_enabled(name, data['enabled'])
+                    else:
+                        if data:
+                            raise RequestError(400, '回滚不接受额外字段。')
+                        tool = programming.rollback(name)
+                    result = {'tool': tool, **state.tool_inventory()}
+                except (ValueError, FileNotFoundError) as error:
+                    raise RequestError(400, '无法更新该工具，请刷新列表并检查可用版本。') from error
             elif path.startswith('/api/sessions/') and path.count('/') == 4:
                 sid, action = path.split('/')[3:]
                 session = state.get_session(sid)
                 if action == 'messages':
                     status, result = 202, state.start(session, data)
+                elif action == 'continue':
+                    run = session['detail'].get('run')
+                    if data or not run or run['status'] not in {'error', 'cancelled', 'interrupted'}:
+                        raise RequestError(409, '当前任务无需恢复，请直接发送后续消息。')
+                    status, result = 202, state.start(session, {'message':
+                        '请根据这个对话的目标和已完成步骤继续处理。先检查已有工具结果与工作文件；'
+                        '执行结果未知的操作不要直接重复，确认现状后再决定下一步。'})
                 elif action == 'stop':
                     run = session['detail']['run']
                     if set(data) != {'run_id'} or not run or data['run_id'] != run['id'] or run['status'] not in ACTIVE:
@@ -831,6 +1205,7 @@ class Handler(BaseHTTPRequestHandler):
                     session['stop'].set()
                     run['status'] = 'stopping'
                     state.assistant_message(session, run)['status'] = 'stopping'
+                    state.checkpoint(session)
                     state.publish_status(session, run)
                     result = {'session': session['detail']}
         if result is None:
@@ -857,6 +1232,21 @@ def main(argv=None):
             raise
         server = create_server(root, 0)
     url = f'http://127.0.0.1:{server.server_address[1]}'
+    registry = root / 'data' / 'server.json'
+    instance = uuid4().hex
+    try:
+        if registry.parent.is_symlink() or registry.is_symlink():
+            raise ValueError('Unsafe server registry path.')
+        registry.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        descriptor, temporary = tempfile.mkstemp(prefix='.server-', dir=registry.parent)
+        try:
+            with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
+                json.dump({'port': server.server_address[1], 'instance_id': instance, 'pid': os.getpid()}, handle)
+            os.replace(temporary, registry)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+    except (OSError, ValueError):
+        print('无法登记启动端口；请保留本次打开的页面。', flush=True)
     print(f'最小 Agent：{url}\n关闭此窗口即可停止服务。', flush=True)
     if not args.no_browser:
         webbrowser.open(url)
@@ -866,6 +1256,11 @@ def main(argv=None):
         pass
     finally:
         server.server_close()
+        try:
+            if not registry.is_symlink() and json.loads(registry.read_text())['instance_id'] == instance:
+                registry.unlink()
+        except (OSError, ValueError, KeyError):
+            pass
     return 0
 
 

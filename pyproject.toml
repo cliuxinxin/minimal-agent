@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "minimal-native-agent"
-version = "0.4.2"
+version = "0.5.0"
 description = "A minimal extensible agent with standard OpenAI and Anthropic tool calling"
 requires-python = ">=3.11"
 dependencies = ["pydantic>=2.7,<3"]

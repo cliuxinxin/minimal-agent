@@ -27,19 +27,37 @@ def reopen_running_app() -> bool:
         from miniagent.runtime import runtime_identity
 
         opener = build_opener(ProxyHandler({}), NoRedirect())
-        with opener.open(URL + '/api/health', timeout=0.5) as response:
-            data = json.loads(response.read(4096))
         expected = runtime_identity(ROOT)
-        if (isinstance(data, dict) and data.get('app') == expected['app']
-                and data.get('workspace_id') == expected['workspace_id']):
-            if (data.get('version') != expected['version']
-                    or data.get('source_revision') != expected['source_revision']):
-                print(f'检测到尚未加载当前更新的旧服务，正在启动 Minimal Agent {expected["version"]}。'
-                      '原服务和正在进行的任务会继续保留。', flush=True)
-                return False
-            print(f'Minimal Agent is already running: {URL}', flush=True)
-            webbrowser.open(URL)
-            return True
+        urls = [URL]
+        registry = ROOT / 'data' / 'server.json'
+        try:
+            if not registry.is_symlink() and not registry.parent.is_symlink():
+                with registry.open('rb') as handle:
+                    registered = json.loads(handle.read(4096))
+                port = registered.get('port')
+                if type(port) is int and 0 < port < 65536:
+                    urls = list(dict.fromkeys([f'http://127.0.0.1:{port}', URL]))
+        except (OSError, ValueError, AttributeError):
+            pass
+        stale = False
+        for url in urls:
+            try:
+                with opener.open(url + '/api/health', timeout=0.5) as response:
+                    data = json.loads(response.read(4096))
+            except (OSError, URLError, ValueError):
+                continue
+            if (isinstance(data, dict) and data.get('app') == expected['app']
+                    and data.get('workspace_id') == expected['workspace_id']):
+                if (data.get('version') != expected['version']
+                        or data.get('source_revision') != expected['source_revision']):
+                    stale = True
+                    continue
+                print(f'Minimal Agent is already running: {url}', flush=True)
+                webbrowser.open(url)
+                return True
+        if stale:
+            print(f'检测到尚未加载当前更新的旧服务，正在启动 Minimal Agent {expected["version"]}。'
+                  '原服务和正在进行的任务会继续保留。', flush=True)
     except (OSError, URLError, ValueError):
         pass
     return False

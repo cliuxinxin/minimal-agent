@@ -214,3 +214,66 @@ dialog::backdrop { background: rgba(20,33,57,.22); backdrop-filter: blur(2px); }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
 }
+
+/* Workbench additions share the existing desktop shell and density. */
+.session-notice { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 11px 30px; flex-shrink: 0; background: #f6f8fd; border-bottom: 1px solid #e5eaf4; color: #526781; font-size: 12px; }
+.session-notice strong { font-weight: 550; }
+.session-notice p { margin: 3px 0 0; color: #7b899b; line-height: 1.6; }
+.session-notice-actions { display: flex; align-items: center; gap: 12px; flex-shrink: 0; }
+.session-notice .button { min-height: 32px; padding: 6px 11px; font-size: 12px; background: white; }
+.storage-warning { flex-shrink: 0; padding: 8px 30px; background: #fff7e9; color: #8b672d; border-bottom: 1px solid #f2e6ca; font-size: 12px; line-height: 1.7; }
+.run-metrics { max-width: 944px; margin: -4px auto 10px; font-size: 10px; color: #8591a3; line-height: 1.65; }
+.connection-checks { margin-top: 23px; padding-top: 19px; border-top: 1px solid var(--border); }
+.connection-checks h3 { margin: 0 0 6px; font-size: 13px; font-weight: 550; }
+.connection-check-actions { display: flex; gap: 9px; margin-top: 12px; }
+.connection-check-actions .button { min-height: 34px; padding: 7px 11px; font-size: 12px; }
+.connection-check-results { margin-top: 12px; padding: 11px 13px; border: 1px solid #e3e9f2; background: #f7f9fc; border-radius: 7px; font-size: 12px; }
+.connection-check-report + .connection-check-report { border-top: 1px solid #e3e9f2; margin-top: 10px; padding-top: 10px; }
+.connection-check-report > strong { font-size: 12px; font-weight: 550; }
+.connection-check-row { display: flex; gap: 9px; align-items: baseline; margin-top: 5px; color: #728096; }
+.connection-check-row p { margin: 0; overflow-wrap: anywhere; line-height: 1.7; }
+.connection-check-marker { font-weight: 600; min-width: 10px; }
+.connection-check-row[data-status="passed"] .connection-check-marker { color: #4d8b6e; }
+.connection-check-row[data-status="failed"] { color: #a45959; }
+.connection-check-pending { color: #6680ae; margin: 0; }
+.tool-metadata { display: flex; align-items: center; gap: 10px; margin-top: 12px; color: #929dad; font-size: 10px; }
+.tool-enabled { background: #edf5f0; color: #51836b; border-radius: 4px; padding: 2px 6px; }
+.tool-enabled.disabled { background: #eef0f3; color: #8590a0; }
+.tool-actions { display: flex; flex-wrap: wrap; gap: 7px; margin: 13px 0 4px; }
+.tool-actions .button { min-height: 30px; padding: 5px 8px; border-radius: 6px; font-size: 11px; }
+.tool-test-result { padding: 9px 10px; border-radius: 6px; margin: 10px 0 0; font-size: 11px; line-height: 1.7; background: #f0f7f2; color: #567c64; }
+.tool-test-result.failed { background: #fff4f2; color: #a3655a; }
+.tool-test-result strong { font-weight: 500; }
+.tool-test-result p { margin: 5px 0 0; overflow-wrap: anywhere; }
+.tool-schema { margin-top: 14px; }
+.tool-schema summary { font-size: 11px; color: #6a7d96; }
+.file-actions { display: flex; align-items: center; flex-wrap: wrap; justify-content: flex-end; gap: 10px; flex-shrink: 0; }
+.file-actions .text-button { font-size: 11px; }
+.artifact-dialog { width: min(920px, calc(100vw - 80px)); max-height: calc(100dvh - 72px); padding: 25px 28px; overflow: auto; }
+.artifact-dialog .dialog-heading { margin-bottom: 19px; }
+.artifact-dialog .dialog-heading > div { min-width: 0; }
+.artifact-dialog .dialog-heading h2 { font-size: 19px; overflow-wrap: anywhere; }
+.artifact-dialog .dialog-heading p { font-size: 11px; }
+.artifact-toolbar { display: flex; align-items: center; gap: 15px; margin-bottom: 15px; }
+.artifact-preview-tabs { display: flex; gap: 16px; margin-right: auto; }
+.artifact-preview-tabs .text-button { color: #8792a4; padding: 7px 0; border-bottom: 2px solid transparent; border-radius: 0; }
+.artifact-preview-tabs .selected { color: #476cb8; border-bottom-color: #7898db; }
+.artifact-toolbar .button { min-height: 32px; padding: 6px 11px; font-size: 12px; text-decoration: none; }
+.artifact-preview-content { max-height: 56dvh; overflow: auto; border: 1px solid #e5eaf2; border-radius: 7px; background: #f8fafc; }
+.artifact-preview-content:empty { border-color: transparent; }
+.artifact-code-preview, .artifact-diff { font: 12px/1.8 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre; tab-size: 4; color: #53617a; padding: 16px; margin: 0; }
+.artifact-diff { max-height: 56dvh; overflow: auto; background: #f8fafc; border: 1px solid #e5eaf2; border-radius: 7px; }
+.artifact-csv-table { width: 100%; border-collapse: collapse; font-size: 12px; line-height: 1.7; text-align: left; background: white; }
+.artifact-csv-table th, .artifact-csv-table td { padding: 9px 12px; min-width: 90px; max-width: 360px; border-bottom: 1px solid #e6ebf2; overflow-wrap: anywhere; vertical-align: top; }
+.artifact-csv-table th { font-weight: 550; background: #f1f5fa; color: #5e728e; }
+.artifact-csv-table tr:last-child td { border-bottom: 0; }
+.artifact-preview-note { margin: 9px 0; color: #8c96a5; font-size: 11px; }
+.artifact-preview-content > .artifact-preview-note { padding: 0 12px; }
+.trace-progress { padding: 12px 14px; border: 1px solid #e4eaf3; border-radius: 8px; margin-bottom: 24px; background: #f9fbfd; }
+.trace-progress h3 { font-size: 12px; font-weight: 550; color: #637690; margin: 0 0 9px; }
+.trace-progress ol { list-style: none; margin: 0; padding: 0; }
+.trace-progress li { display: flex; justify-content: space-between; gap: 12px; padding: 4px 0; font: 11px/1.7 ui-monospace, SFMono-Regular, Consolas, monospace; color: #73829a; }
+.trace-progress li small { color: #8b99aa; font: 10px/1.7 var(--font); white-space: nowrap; }
+.trace-progress li[data-status="completed"] small { color: #658b76; }
+.trace-progress li[data-status="running"] small { color: #527ec1; }
+.trace-progress li[data-status="error"] small, .trace-progress li[data-status="interrupted"] small { color: #ad7966; }

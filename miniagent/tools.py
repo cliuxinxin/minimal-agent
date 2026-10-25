@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 
 
 _STOP_CHECK: ContextVar[Callable[[], bool] | None] = ContextVar('tool_stop_check', default=None)
+_RUN_ID: ContextVar[str | None] = ContextVar('tool_run_id', default=None)
 
 
 def execution_stopped() -> bool:
@@ -21,12 +22,19 @@ def execution_stopped() -> bool:
     return bool(check()) if check is not None else False
 
 
+def execution_run_id() -> str | None:
+    """Identify the current run for short-lived, session-isolated tool caches."""
+    return _RUN_ID.get()
+
+
 @contextmanager
-def tool_execution_context(should_stop: Callable[[], bool]):
+def tool_execution_context(should_stop: Callable[[], bool], run_id: str | None = None):
     token = _STOP_CHECK.set(should_stop)
+    run_token = _RUN_ID.set(run_id)
     try:
         yield
     finally:
+        _RUN_ID.reset(run_token)
         _STOP_CHECK.reset(token)
 
 

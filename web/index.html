@@ -53,6 +53,11 @@
         <div class="runtime-banner-footer"><span id="runtime-versions"></span><div class="runtime-actions"><button class="text-button" id="recheck-runtime" type="button">重新检查</button><button class="text-button" id="copy-runtime-diagnostic" type="button">复制运行诊断</button></div></div>
       </section>
       <div class="connection-banner" id="connection-banner" role="alert" hidden></div>
+      <section class="session-notice" id="session-notice" role="status" hidden>
+        <div><strong id="session-notice-title"></strong><p id="session-notice-detail"></p></div>
+        <div class="session-notice-actions"><button class="button quiet" id="resume-session" type="button" hidden>继续处理</button><button class="text-button" id="recovery-settings" type="button" hidden>打开模型设置</button></div>
+      </section>
+      <div class="storage-warning" id="storage-warning" role="alert" hidden></div>
 
       <section class="conversation" id="conversation" aria-label="对话内容">
         <div class="empty-state" id="empty-state">
@@ -65,6 +70,7 @@
 
       <div class="composer-region">
         <div class="run-status" id="run-status" role="status" aria-live="polite" hidden></div>
+        <p class="run-metrics" id="run-metrics" hidden></p>
         <form class="composer" id="message-form">
           <div class="attachments" id="attachments" hidden></div>
           <label class="sr-only" for="message-input">任务内容</label>
@@ -98,6 +104,12 @@
         <div class="password-field"><input id="search-api-key" name="search_api_key" type="password" autocomplete="new-password" placeholder="填写 DeepSeek API Key"><button type="button" class="icon-button" id="toggle-search-key" aria-label="显示搜索 API Key" aria-pressed="false"><svg class="icon"><use href="#i-eye"/></svg></button></div>
         <p class="field-hint" id="search-key-hint">填入后启用网页搜索与正文读取，可配合任一模型使用。</p>
       </div>
+      <section class="connection-checks" aria-labelledby="connection-check-title">
+        <h3 id="connection-check-title">连接检查</h3>
+        <p class="field-hint">点击后使用当前填写的设置，产生少量真实 API 用量；不会保存设置或运行你的编程工具。</p>
+        <div class="connection-check-actions"><button class="button quiet" id="check-model-connection" type="button">检查模型连接</button><button class="button quiet" id="check-search-connection" type="button">检查搜索连接</button></div>
+        <div class="connection-check-results" id="connection-check-results" role="status" aria-live="polite" hidden></div>
+      </section>
       <p class="runtime-note">Python 以当前用户权限在本机运行，不是系统沙箱。单次运行最多 60 秒，输出最多 64 KiB。保存的新工具会在重启和更新后保留。</p>
       <p class="form-error" id="settings-error" role="alert" hidden></p>
       </div>
@@ -118,6 +130,7 @@
   <dialog class="drawer tools-drawer" id="tools-dialog" aria-labelledby="tools-title">
     <div class="dialog-heading"><div><h2 id="tools-title">工具</h2><p>让 Agent 编写代码，积累可重复使用的工具。</p></div><button class="icon-button" type="button" data-close="tools-dialog" aria-label="关闭工具"><svg class="icon"><use href="#i-close"/></svg></button></div>
     <div class="tools-toolbar"><span id="tools-loading" role="status" hidden>正在加载工具…</span><button class="text-button" type="button" id="refresh-tools">刷新列表</button></div>
+    <p class="field-hint">启停从下一次模型请求生效。样例测试会实际运行本机 Python；更新后可以回到上一版。</p>
     <p class="form-error" id="tools-error" role="alert" hidden></p>
     <p class="form-error" id="tools-warning" role="status" hidden></p>
     <section class="tool-section" aria-labelledby="builtin-tools-title"><h3 id="builtin-tools-title">内置能力</h3><div id="builtin-tools-list" class="tool-list"></div></section>
@@ -127,7 +140,17 @@
 
   <dialog class="drawer trace-drawer" id="trace-dialog" aria-labelledby="trace-title">
     <div class="dialog-heading"><div><h2 id="trace-title">运行记录</h2><p id="trace-subtitle">本次任务的模型请求与工具执行。</p></div><button class="icon-button" type="button" data-close="trace-dialog" aria-label="关闭运行记录"><svg class="icon"><use href="#i-close"/></svg></button></div>
+    <section class="trace-progress" id="trace-progress" aria-label="最近工具步骤" hidden><h3>最近工具步骤</h3><ol id="trace-progress-list"></ol></section>
     <div class="trace-list" id="trace-list"></div>
+  </dialog>
+
+  <dialog class="artifact-dialog" id="artifact-dialog" aria-labelledby="artifact-title">
+    <div class="dialog-heading"><div><h2 id="artifact-title">文件预览</h2><p id="artifact-meta">正在读取保存的成果…</p></div><button class="icon-button" type="button" data-close="artifact-dialog" aria-label="关闭文件预览"><svg class="icon"><use href="#i-close"/></svg></button></div>
+    <div class="artifact-toolbar"><div class="artifact-preview-tabs"><button class="text-button selected" id="artifact-content-tab" type="button" aria-pressed="true">内容</button><button class="text-button" id="artifact-diff-tab" type="button" aria-pressed="false" hidden>本次修改</button></div><button class="text-button" id="copy-artifact" type="button" disabled>复制内容</button><a class="button quiet" id="download-artifact" hidden download>下载文件</a></div>
+    <p class="form-error" id="artifact-error" role="alert" hidden></p>
+    <p class="artifact-preview-note" id="artifact-preview-note" hidden>仅显示内容预览，下载可获取完整文件。</p>
+    <div class="artifact-preview-content" id="artifact-preview-content"></div>
+    <pre class="artifact-diff" id="artifact-diff" hidden></pre>
   </dialog>
 
   <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>

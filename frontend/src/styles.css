@@ -101,3 +101,30 @@
 .diagnostic-storage-warning { margin: 0 0 9px; padding: 7px 9px; border-radius: 5px; background: #fff7e9; color: #97712f; font-size: 11px; line-height: 1.7; }
 .diagnostic-trigger:focus-visible, .diagnostic-actions button:focus-visible, .diagnostic-json:focus-visible { outline: 2px solid #99afe3; outline-offset: 2px; }
 @media (max-width: 1100px) { .diagnostic-fields { gap: 7px 12px; } .diagnostic-trigger-hint { display: none; } }
+
+.message-artifacts, .message-sources { margin: 20px 0 14px; }
+.message-artifacts h3, .message-sources h3 { display: flex; align-items: center; gap: 7px; margin: 0 0 10px; font-size: 12px; font-weight: 550; color: #6b7c94; }
+.message-artifacts h3 > span, .message-sources h3 > span { color: #98a4b5; font-size: 10px; font-weight: 400; }
+.artifact-list { display: grid; gap: 8px; }
+.artifact-card { display: flex; align-items: center; gap: 12px; border: 1px solid #e3e9f3; border-radius: 8px; padding: 12px 14px; background: #fafcfe; }
+.artifact-card .artifact-icon { width: 24px; height: 24px; color: #7491bc; flex-shrink: 0; }
+.artifact-card-info { min-width: 0; flex: 1; }
+.artifact-card-info strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 500 12px/1.7 ui-monospace, SFMono-Regular, Consolas, monospace; color: #435975; }
+.artifact-card-info small { color: #94a0b1; font-size: 10px; }
+.artifact-preview, .artifact-download { display: inline-flex; align-items: center; gap: 5px; flex-shrink: 0; border: 1px solid #dfe7f1; border-radius: 5px; background: white; padding: 5px 9px; font: 11px/1.5 var(--font); color: #5c79a7; text-decoration: none; }
+.artifact-download svg { width: 12px; height: 12px; }
+.artifact-preview:hover, .artifact-download:hover { background: #f0f5fd; }
+.source-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.source-card { display: flex; flex-direction: column; gap: 6px; min-width: 0; border: 1px solid #e5eaf2; border-radius: 8px; padding: 11px 13px; text-decoration: none; background: #fff; color: #536883; }
+.source-card:hover { background: #f8fafd; border-color: #cbd8ec; }
+.source-card-top { display: flex; align-items: center; gap: 8px; justify-content: space-between; }
+.source-reference { font: 10px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; color: #94a2b8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 48%; }
+.source-read { display: inline-flex; align-items: center; gap: 4px; color: #94a0b0; font-size: 10px; flex-shrink: 0; }
+.source-read.read { color: #6b8b75; }
+.source-read svg { width: 11px; height: 11px; }
+.source-card > strong { font-size: 12px; line-height: 1.65; font-weight: 500; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.source-card > strong svg { display: inline; vertical-align: -1px; width: 11px; height: 11px; margin-left: 5px; color: #9cabbf; }
+.source-card > small { color: #9aa5b4; font-size: 10px; line-height: 1.6; overflow-wrap: anywhere; }
+.message-metrics { color: #8c99ac; font-size: 10px; line-height: 1.8; margin: 14px 0 6px; }
+.source-reference-warning { margin: 10px 0; padding: 8px 11px; border-radius: 6px; color: #96763e; background: #fcf7ed; font-size: 11px; line-height: 1.7; }
+.artifact-preview:focus-visible, .artifact-download:focus-visible, .source-card:focus-visible { outline: 2px solid #a1b7e6; outline-offset: 3px; }

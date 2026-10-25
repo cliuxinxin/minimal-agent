@@ -1,5 +1,5 @@
 import { mountConversation, stopCurrentRun, FRONTEND_VERSION,
-  assessRuntimeCompatibility, createRuntimeDiagnostic } from "./assets/chat.js";
+  assessRuntimeCompatibility, createRuntimeDiagnostic, normalizeArtifacts, formatMetrics } from "./assets/chat.js";
 
 "use strict";
 
@@ -14,6 +14,8 @@ const state = {
   toolInventory: { tools: [], saved_tools: [], tool_errors: [] },
   toolsRequest: 0, toolsRun: null, searchKeyRemoved: false,
   runtimeCompatibility: null, runtimeCheckedAt: null, checkingRuntime: false, runtimeError: null,
+  storageWarning: null, connectionCheck: null, checkRequest: 0, checkResults: {},
+  toolBusy: new Set(), toolTestResults: new Map(), artifactRequest: 0, artifactPreview: null,
 };
 const active = (run) => run && ["running", "stopping"].includes(run.status);
 const busy = () => state.sending || state.uploading || state.selecting;
@@ -220,7 +222,16 @@ function renderFiles() {
     button.disabled = selected || busy();
     button.setAttribute("aria-label", `${selected ? "已添加" : "添加"} ${file.name}`);
     button.addEventListener("click", () => { attach(file.name); toast(`已添加 ${file.name}`); });
-    row.append(icon("file"), info, button); holder.append(row);
+    const actions = node("div", "file-actions");
+    const artifact = normalizeArtifacts([file.artifact])[0];
+    if (artifact) {
+      const preview = node("button", "text-button", "预览"); preview.type = "button";
+      preview.addEventListener("click", () => openArtifact(artifact.id));
+      const download = node("a", "text-button", "下载"); download.href = artifact.download_url; download.download = "";
+      actions.append(preview, download);
+    }
+    actions.append(button);
+    row.append(icon("file"), info, actions); holder.append(row);
   }
 }
 
@@ -251,6 +262,30 @@ function renderTools() {
     const summary = node("summary");
     summary.append(node("strong", "", tool.name), node("span", "", tool.description));
     item.append(summary);
+    const metadata = node("div", "tool-metadata");
+    metadata.append(node("span", `tool-enabled ${tool.enabled === false ? "disabled" : ""}`, tool.enabled === false ? "已停用" : "已启用"),
+      node("span", "", `v${tool.version || 1} · ${tool.test_count || 1} 组样例`));
+    item.append(metadata);
+    const actions = node("div", "tool-actions");
+    const actionButton = (label, action, payload) => {
+      const button = node("button", "button quiet", label); button.type = "button";
+      button.dataset.toolAction = action; button.dataset.toolName = tool.name;
+      button.disabled = state.toolBusy.size > 0;
+      button.addEventListener("click", () => manageTool(tool, action, payload));
+      return button;
+    };
+    actions.append(actionButton(tool.enabled === false ? "启用" : "停用", "enabled", { enabled: tool.enabled === false }),
+      actionButton(state.toolBusy.has(tool.name) ? "处理中…" : "运行样例测试", "test", {}));
+    if (Number.isInteger(tool.previous_version)) actions.append(actionButton(`回到 v${tool.previous_version}`, "rollback", {}));
+    item.append(actions);
+    const test = state.toolTestResults.get(tool.name);
+    if (test && test.version === tool.version) {
+      const result = node("div", `tool-test-result ${test.passed ? "passed" : "failed"}`);
+      result.setAttribute("role", "status");
+      result.append(node("strong", "", test.passed ? `${test.total} 组样例全部通过` : "部分样例未通过"));
+      for (const row of test.results || []) if (!row.passed) result.append(node("p", "", `样例 ${row.index}：${row.error || "结果与预期不一致"}`));
+      item.append(result);
+    }
     const updated = new Date(tool.updated_at);
     if (!Number.isNaN(updated.getTime())) item.append(node("p", "tool-updated", `更新于 ${updated.toLocaleString("zh-CN", { hour12: false })}`));
     const sourceHeading = node("div", "tool-source-heading");
@@ -263,6 +298,17 @@ function renderTools() {
     item.append(sourceHeading, node("pre", "tool-source", tool.code || ""),
       node("div", "tool-example-heading", "测试输入示例"),
       node("pre", "tool-example", JSON.stringify(tool.example_arguments ?? {}, null, 2)));
+    item.append(node("div", "tool-example-heading", "预期结果"), node("pre", "tool-example", JSON.stringify(tool.expected_result ?? null, null, 2)));
+    if (tool.input_schema) {
+      const schema = node("details", "tool-schema");
+      schema.append(node("summary", "", "输入字段约定"), node("pre", "tool-example", JSON.stringify(tool.input_schema, null, 2)));
+      item.append(schema);
+    }
+    if (Array.isArray(tool.tests) && tool.tests.length) {
+      const tests = node("details", "tool-schema");
+      tests.append(node("summary", "", `其他 ${tool.tests.length} 组测试样例`), node("pre", "tool-example", JSON.stringify(tool.tests, null, 2)));
+      item.append(tests);
+    }
     holder.append(item);
   }
   const warnings = errors.map((error) => typeof error === "string" ? error
@@ -272,6 +318,7 @@ function renderTools() {
 }
 
 async function refreshTools() {
+  if (state.toolBusy.size) return;
   const request = ++state.toolsRequest;
   $("tools-loading").hidden = false; $("refresh-tools").disabled = true;
   formError("tools-error", "");
@@ -288,6 +335,27 @@ async function refreshTools() {
     if (request === state.toolsRequest) {
       $("tools-loading").hidden = true; $("refresh-tools").disabled = false;
     }
+  }
+}
+
+async function manageTool(tool, action, payload) {
+  if (state.toolBusy.size || !/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(tool.name)) return;
+  ++state.toolsRequest;
+  state.toolBusy.add(tool.name); $("refresh-tools").disabled = true;
+  formError("tools-error", ""); renderTools();
+  let failure = null;
+  try {
+    const result = await api(`/api/tools/${encodeURIComponent(tool.name)}/${action}`, payload);
+    if (action === "test" && result.result) state.toolTestResults.set(tool.name, { ...result.result, version: result.result.version ?? tool.version });
+    else state.toolTestResults.delete(tool.name);
+    if (Array.isArray(result.saved_tools)) state.toolInventory = result;
+    if (action === "enabled") toast(payload.enabled ? "工具已启用。" : "工具已停用。");
+    else if (action === "rollback") toast("已恢复上一版工具。");
+  } catch (error) { failure = error.message; }
+  finally {
+    state.toolBusy.delete(tool.name); $("refresh-tools").disabled = false;
+    renderTools(); await refreshTools();
+    if (failure) formError("tools-error", failure);
   }
 }
 
@@ -310,6 +378,7 @@ function renderMessages() {
         if (state.runtimeCompatibility?.blocksNewRuns) {
           toast("请重新双击 Start，在新版页面中发送任务。"); return;
         }
+        if (state.session?.resume_available === false) { toast(state.session.resume_reason || "当前会话暂时无法继续。"); return; }
         $("message-input").value = text;
         await sendMessage({ preventDefault() {} });
       },
@@ -320,6 +389,34 @@ function renderMessages() {
     run: state.session?.run || null, busy: busy() });
 }
 
+function renderRecovery() {
+  const session = state.session;
+  const status = session?.run?.status;
+  const incomplete = ["interrupted", "cancelled", "error", "step_limit", "stalled"].includes(status);
+  const elsewhere = status === "running_elsewhere";
+  const blocked = session?.resume_available === false;
+  $("session-notice").hidden = !session || (!incomplete && !blocked && !session.restored);
+  $("session-notice-title").textContent = elsewhere ? "这项任务正在其他启动窗口运行" : blocked ? "当前会话暂时无法继续"
+    : incomplete ? "可以从已保存的进度继续" : "对话已从本机恢复";
+  $("session-notice-detail").textContent = blocked ? session.resume_reason || "请检查模型设置后重新打开这段对话。"
+    : incomplete ? "已完成的步骤和成果会保留；继续时会检查未完成的操作。" : "历史消息和上下文已保存，可以直接接着提问。";
+  $("resume-session").hidden = !incomplete || blocked;
+  $("resume-session").disabled = busy() || Boolean(state.runtimeCompatibility?.blocksNewRuns);
+  $("recovery-settings").hidden = !blocked || elsewhere;
+  const warning = session?.storage_warning || session?.run?.storage_warning || state.storageWarning;
+  formError("storage-warning", warning);
+}
+
+function renderRunMetrics() {
+  const run = state.session?.run;
+  const start = run?.started_at ? Date.parse(run.started_at) : NaN;
+  const elapsed = active(run) && Number.isFinite(start) ? Math.max(0, (Date.now() - start) / 1000) : null;
+  const text = run?.metrics ? formatMetrics({ ...run.metrics, ...(elapsed === null ? {} : { elapsed_seconds: elapsed }) })
+    : elapsed !== null ? `已运行 ${Math.floor(elapsed)} 秒${run.step ? ` · 模型 ${run.step} 次` : ""}` : "";
+  $("run-metrics").textContent = text;
+  $("run-metrics").hidden = !text || !active(run);
+}
+
 function renderRun() {
   const run = state.session?.run;
   const running = active(run);
@@ -327,7 +424,7 @@ function renderRun() {
   const button = $("send-button");
   button.classList.toggle("stopping", run?.status === "stopping");
   button.disabled = busy() || !state.initialized || run?.status === "stopping" ||
-    (!running && Boolean(state.runtimeCompatibility?.blocksNewRuns));
+    (!running && (Boolean(state.runtimeCompatibility?.blocksNewRuns) || state.session?.resume_available === false));
   button.setAttribute("aria-label", running ? "停止运行" : "发送消息");
   button.replaceChildren(icon(running ? "stop" : "send"));
   $("run-status").hidden = !running && !state.sending;
@@ -335,9 +432,12 @@ function renderRun() {
   else if (run?.status === "stopping") $("run-status").textContent = "正在停止当前任务…";
   else if (running) {
     const last = run.events?.at(-1);
-    $("run-status").textContent = last?.event === "tool_call"
+    const phases = { preparing: "正在准备任务…", waiting_model: "等待模型响应…", generating: "模型正在输出…",
+      running_tool: "正在执行工具…", compacting: "正在整理较早的上下文…", working: "正在处理…" };
+    $("run-status").textContent = run.phase ? phases[run.phase] || "正在处理…" : last?.event === "tool_call"
       ? `正在执行 ${last.data.name}…` : `正在处理${run.step ? ` · 第 ${run.step} 步` : ""}…`;
   }
+  renderRecovery(); renderRunMetrics();
   // Freeze state changes while a local send, upload, or session switch is pending.
   // Once the POST is acknowledged, a running model does not block drafting the next turn.
   $("message-input").readOnly = state.sending || state.selecting;
@@ -364,8 +464,17 @@ function renderTrace(force = false) {
   const opened = new Set([...holder.querySelectorAll("details[open]")].map((item) => item.dataset.key));
   const scroll = $("trace-dialog").scrollTop;
   holder.replaceChildren();
+  const progress = $("trace-progress-list"); progress.replaceChildren();
+  const tools = runMessage(run?.id)?.segments?.filter((part) => part.type === "tool").slice(-6) || [];
+  $("trace-progress").hidden = tools.length === 0;
+  const toolStates = { preparing: "准备中", running: "执行中", completed: "已完成", error: "未完成", cancelled: "已停止", not_executed: "未执行", interrupted: "结果待检查" };
+  for (const tool of tools) {
+    const row = node("li"); row.dataset.status = tool.status;
+    row.append(node("span", "", tool.name || "准备调用工具"), node("small", "", toolStates[tool.status] || "状态待确认"));
+    progress.append(row);
+  }
   if (!run) { holder.append(node("p", "empty-list", "发送一个任务后，这里会显示运行过程。")); return; }
-  const statuses = { running: "正在运行", stopping: "正在停止", completed: "已完成", error: "运行失败", cancelled: "已停止" };
+  const statuses = { running: "正在运行", stopping: "正在停止", completed: "已完成", error: "运行失败", cancelled: "已停止", interrupted: "已中断", running_elsewhere: "其他窗口运行中" };
   $("trace-subtitle").textContent = `${statuses[run.status] || run.status} · ${run.step} 次模型请求` +
     (omitted ? ` · 仅显示最近 ${events.length} 条记录；已省略 ${omitted} 条，完整记录见本机 runs 文件夹。` : "");
   for (const [index, event] of events.entries()) {
@@ -373,6 +482,12 @@ function renderTrace(force = false) {
     let title, description = "", details = null, kind = "";
     if (event.event === "run_start") { title = "任务开始"; }
     else if (event.event === "model_start") { title = `请求模型 · 第 ${event.step} 步`; }
+    else if (event.event === "context_compaction") {
+      const phase = data.status || data.phase;
+      title = phase === "completed" ? "上下文整理完成" : phase === "error" ? "上下文整理未完成" : "正在整理上下文";
+      description = data.error || data.message || "保留近期完整对话与已确认的任务信息。";
+      kind = phase === "error" ? "error" : phase === "completed" ? "success" : "";
+    }
     else if (event.event === "tool_call") {
       title = data.name; description = "调用工具"; kind = "tool";
       try { details = JSON.stringify(JSON.parse(data.arguments), null, 2); }
@@ -499,8 +614,11 @@ function connectStream(id, revision) {
     const status = active(data) ? data.status : state.session.run.status;
     Object.assign(state.session.run, { status, step: data.step, error: data.error,
       event_count: data.event_count, omitted_events: data.omitted_events });
+    for (const key of ["metrics", "phase", "last_activity_at", "finished_at", "storage_warning"]) {
+      if (Object.hasOwn(data, key)) state.session.run[key] = data[key];
+    }
     const message = runMessage(data.run_id);
-    if (message) message.status = status;
+    if (message) { message.status = status; if (data.metrics) message.metrics = data.metrics; }
     updateSessionSummary();
     queueStreamRender(true);
   });
@@ -588,6 +706,7 @@ async function sendMessage(event) {
   if (state.runtimeCompatibility?.blocksNewRuns) {
     toast("请重新双击 Start，在新版页面中发送任务。"); return;
   }
+  if (state.session?.resume_available === false) { toast(state.session.resume_reason || "当前会话暂时无法继续。"); return; }
   const text = $("message-input").value.trim();
   if (!text && !state.attachments.length) { $("message-input").focus(); return; }
   if (!state.config.configured && !state.session) { openSettings(); return; }
@@ -612,7 +731,7 @@ async function sendMessage(event) {
     // Show the acknowledged run immediately; the first SSE snapshot is authoritative.
     state.session.messages.push({ role: "user", content: message },
       { role: "assistant", run_id: accepted.run_id, content: "", status: "running", segments: [], segments_omitted: 0 });
-    state.session.run = { id: accepted.run_id, status: "running", step: 0, events: [], event_count: 0, omitted_events: 0 };
+    state.session.run = { id: accepted.run_id, status: "running", step: 0, events: [], event_count: 0, omitted_events: 0, started_at: new Date().toISOString() };
     if (!state.session.title || state.session.title === "新对话") state.session.title = text.slice(0, 42) || "文件任务";
     updateSessionSummary(); renderSession(true);
     connectStream(targetId, revision);
@@ -622,6 +741,21 @@ async function sendMessage(event) {
     if (targetId && revision === state.revision) {
       // Recover the actual server state after an uncertain POST response.
       await recoverSession(targetId, revision);
+    }
+  } finally { state.sending = false; renderRun(); }
+}
+
+async function continueSession() {
+  const session = state.session;
+  if (!session || busy() || active(session.run) || session.resume_available === false || state.runtimeCompatibility?.blocksNewRuns) return;
+  const id = session.id, revision = state.revision;
+  state.sending = true; renderRun();
+  try {
+    await api(`/api/sessions/${encodeURIComponent(id)}/continue`, {});
+    if (revision === state.revision && state.session?.id === id) await recoverSession(id, revision);
+  } catch (error) {
+    if (revision === state.revision && state.session?.id === id) {
+      toast(error.message); await recoverSession(id, revision);
     }
   } finally { state.sending = false; renderRun(); }
 }
@@ -683,6 +817,7 @@ function updateSearchKeyHint() {
 
 function openSettings() {
   if (busy()) return;
+  ++state.checkRequest; state.connectionCheck = null; state.checkResults = {}; renderConnectionChecks();
   $("provider").value = state.config.provider;
   $("model").value = state.config.model;
   $("api-key").value = ""; $("api-key").type = "password";
@@ -698,16 +833,79 @@ function openSettings() {
   $("settings-dialog").showModal();
 }
 
-async function saveSettings(event) {
-  event.preventDefault();
-  const button = $("save-settings");
-  if (button.disabled) return;
-  const payload = {
+function settingsPayload() {
+  return {
     provider: $("provider").value, model: $("model").value.trim(),
     api_key: $("api-key").value.trim(), base_url: $("base-url").value.trim(),
     max_steps: $("max-steps").value === "unlimited" ? null : Number($("max-steps").value),
     search_api_key: state.searchKeyRemoved ? null : $("search-api-key").value.trim(),
   };
+}
+
+function renderConnectionChecks() {
+  const holder = $("connection-check-results"); holder.replaceChildren();
+  const labels = { model: "模型连接", search: "搜索连接" };
+  for (const target of ["model", "search"]) {
+    const checking = state.connectionCheck === target;
+    const button = $(`check-${target}-connection`);
+    button.disabled = Boolean(state.connectionCheck);
+    button.textContent = checking ? "正在检查…" : `检查${labels[target]}`;
+    if (checking) {
+      holder.append(node("p", "connection-check-pending", `${labels[target]}检查中，请稍候…`));
+      continue;
+    }
+    const report = state.checkResults[target];
+    if (!report) continue;
+    const section = node("section", "connection-check-report"); section.dataset.target = target;
+    section.append(node("strong", "", `${labels[target]} · ${report.ok ? "检查通过" : "需要处理"}`));
+    for (const check of Array.isArray(report.checks) ? report.checks : []) {
+      const row = node("div", "connection-check-row");
+      row.dataset.status = ["passed", "failed", "skipped"].includes(check.status) ? check.status : "failed";
+      row.append(node("span", "connection-check-marker", check.status === "passed" ? "✓" : check.status === "skipped" ? "—" : "!"),
+        node("p", "", String(check.message || check.name || "检查未返回说明")));
+      section.append(row);
+    }
+    holder.append(section);
+  }
+  holder.hidden = holder.childElementCount === 0;
+}
+
+async function checkConnection(target) {
+  if (state.connectionCheck || !$("settings-dialog").open) return;
+  const request = ++state.checkRequest;
+  const config = settingsPayload();
+  const signature = JSON.stringify(config);
+  state.connectionCheck = target;
+  delete state.checkResults[target]; renderConnectionChecks();
+  const current = () => request === state.checkRequest && $("settings-dialog").open;
+  try {
+    const result = await api("/api/check-connection", { target, config });
+    if (!current()) return;
+    state.checkResults[target] = signature === JSON.stringify(settingsPayload()) ? result : {
+      ok: false, checks: [{ status: "skipped", message: "检查期间设置已更改，请使用当前设置重新检查。" }],
+    };
+  } catch (error) {
+    if (!current()) return;
+    state.checkResults[target] = signature === JSON.stringify(settingsPayload())
+      ? { ok: false, checks: [{ status: "failed", message: error.message }] }
+      : { ok: false, checks: [{ status: "skipped", message: "检查期间设置已更改，请使用当前设置重新检查。" }] };
+  } finally {
+    if (current()) { state.connectionCheck = null; renderConnectionChecks(); }
+  }
+}
+
+function invalidateConnectionResults() {
+  state.checkResults = {};
+  renderConnectionChecks();
+}
+
+async function saveSettings(event) {
+  event.preventDefault();
+  const button = $("save-settings");
+  if (button.disabled) return;
+  const payload = settingsPayload();
+  ++state.checkRequest; state.connectionCheck = null;
+  renderConnectionChecks();
   const controls = [...$("settings-form").querySelectorAll("input, select, button")];
   const disabledBefore = controls.map((control) => control.disabled);
   controls.forEach((control) => { control.disabled = true; });
@@ -734,6 +932,61 @@ async function openFiles() {
   renderFiles(); $("files-dialog").showModal();
   try { const result = await api("/api/files"); state.files = result.files; renderFiles(); }
   catch (error) { formError("files-error", error.message); }
+}
+
+function showArtifactTab(diff) {
+  $("artifact-preview-content").hidden = diff;
+  $("artifact-diff").hidden = !diff;
+  $("artifact-content-tab").classList.toggle("selected", !diff);
+  $("artifact-diff-tab").classList.toggle("selected", diff);
+  $("artifact-content-tab").setAttribute("aria-pressed", String(!diff));
+  $("artifact-diff-tab").setAttribute("aria-pressed", String(diff));
+}
+
+async function openArtifact(id) {
+  if (typeof id !== "string" || !/^[a-f0-9]{32}$/.test(id)) return;
+  const request = ++state.artifactRequest;
+  state.artifactPreview = null;
+  $("artifact-title").textContent = "文件预览";
+  $("artifact-meta").textContent = "正在读取保存的成果…";
+  $("artifact-preview-content").replaceChildren(); $("artifact-diff").textContent = "";
+  $("artifact-diff-tab").hidden = true; $("artifact-preview-note").hidden = true;
+  $("copy-artifact").disabled = true; $("download-artifact").hidden = true;
+  $("download-artifact").removeAttribute("href"); formError("artifact-error", ""); showArtifactTab(false);
+  if (!$("artifact-dialog").open) $("artifact-dialog").showModal();
+  try {
+    const result = await api(`/api/artifacts/${id}`);
+    if (request !== state.artifactRequest || !$("artifact-dialog").open) return;
+    const artifact = normalizeArtifacts([result.artifact])[0];
+    if (!artifact || artifact.id !== id || typeof result.content !== "string") throw new Error("文件预览格式无效。");
+    state.artifactPreview = result;
+    $("artifact-title").textContent = artifact.name;
+    $("artifact-meta").textContent = `${artifact.change === "modified" ? "修改后的版本" : "生成的文件"} · ${sizeLabel(artifact.size)} · 本次任务保存的成果`;
+    $("artifact-preview-note").hidden = !result.truncated;
+    $("download-artifact").href = artifact.download_url; $("download-artifact").hidden = false;
+    $("copy-artifact").disabled = false;
+    const holder = $("artifact-preview-content");
+    if (Array.isArray(result.columns) && Array.isArray(result.rows)) {
+      const table = node("table", "artifact-csv-table"), thead = node("thead"), tbody = node("tbody"), heading = node("tr");
+      for (const column of result.columns.slice(0, 100)) heading.append(node("th", "", String(column)));
+      thead.append(heading);
+      for (const row of result.rows.slice(0, 30)) {
+        if (!Array.isArray(row)) continue;
+        const tr = node("tr");
+        for (const cell of row.slice(0, 100)) tr.append(node("td", "", String(cell)));
+        tbody.append(tr);
+      }
+      table.append(thead, tbody); holder.append(table);
+      holder.append(node("p", "artifact-preview-note", "表格显示前 30 行，下载可获取完整文件。"));
+    } else holder.append(node("pre", "artifact-code-preview", result.content));
+    if (typeof result.diff === "string" && result.diff) {
+      $("artifact-diff").textContent = result.diff; $("artifact-diff-tab").hidden = false;
+    }
+  } catch (error) {
+    if (request !== state.artifactRequest || !$("artifact-dialog").open) return;
+    $("artifact-meta").textContent = "文件暂时无法预览";
+    formError("artifact-error", error.message);
+  }
 }
 
 async function uploadFiles() {
@@ -764,6 +1017,17 @@ async function uploadFiles() {
 
 function bindEvents() {
   window.addEventListener("beforeunload", closeStream);
+  window.addEventListener("minimal-agent:preview-artifact", (event) => openArtifact(event.detail?.id));
+  $("resume-session").addEventListener("click", continueSession);
+  $("recovery-settings").addEventListener("click", openSettings);
+  $("artifact-content-tab").addEventListener("click", () => showArtifactTab(false));
+  $("artifact-diff-tab").addEventListener("click", () => showArtifactTab(true));
+  $("artifact-dialog").addEventListener("close", () => { ++state.artifactRequest; state.artifactPreview = null; });
+  $("copy-artifact").addEventListener("click", async () => {
+    if (!state.artifactPreview) return;
+    try { await navigator.clipboard.writeText(state.artifactPreview.content); toast("预览内容已复制。"); }
+    catch { toast("复制未成功，请选中预览内容后复制。"); }
+  });
   $("recheck-runtime").addEventListener("click", async () => {
     const compatibility = await checkRuntime();
     if (compatibility?.status === "compatible") toast("页面与后台版本一致，可以继续发送任务。");
@@ -772,9 +1036,14 @@ function bindEvents() {
   $("new-chat").addEventListener("click", newChat);
   $("open-settings").addEventListener("click", openSettings);
   $("settings-form").addEventListener("submit", saveSettings);
+  $("settings-form").addEventListener("input", invalidateConnectionResults);
+  $("settings-form").addEventListener("change", invalidateConnectionResults);
   $("settings-dialog").addEventListener("close", () => {
+    ++state.checkRequest; state.connectionCheck = null; state.checkResults = {}; renderConnectionChecks();
     $("api-key").value = ""; $("search-api-key").value = ""; state.searchKeyRemoved = false;
   });
+  $("check-model-connection").addEventListener("click", () => checkConnection("model"));
+  $("check-search-connection").addEventListener("click", () => checkConnection("search"));
   $("settings-dialog").addEventListener("cancel", (event) => {
     if ($("save-settings").disabled) event.preventDefault();
   });
@@ -796,6 +1065,7 @@ function bindEvents() {
     state.searchKeyRemoved = !state.searchKeyRemoved;
     $("search-api-key").value = "";
     updateSearchKeyHint();
+    invalidateConnectionResults();
   });
   document.querySelectorAll("[data-close]").forEach((button) => {
     button.addEventListener("click", () => $(button.dataset.close).close());
@@ -845,6 +1115,7 @@ async function initialize() {
   try {
     const result = await api("/api/bootstrap");
     state.config = result.config; state.sessions = result.sessions; state.files = result.files;
+    state.storageWarning = result.storage_warning || null;
     await checkRuntime(result);
     state.initialized = true; renderConfig(); renderSessions(); renderFiles(); renderRun();
     if (state.sessions.length) await selectSession(state.sessions[0].id);
@@ -852,3 +1123,5 @@ async function initialize() {
 }
 
 initialize();
+// This updates only the local elapsed-time label; there are no polling requests.
+setInterval(() => { if (active(state.session?.run)) renderRunMetrics(); }, 1000);

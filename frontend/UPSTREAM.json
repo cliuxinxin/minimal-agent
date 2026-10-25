@@ -50,6 +50,7 @@
     "MarkdownText disables synthetic smooth reveal, repairs only active display text with Remend, restricts clickable URLs to HTTP(S), and renders image references as text.",
     "SyntaxHighlighter uses the official PrismLight adapter with directly imported common languages so no language module or asset is fetched at runtime.",
     "The cn workspace helper is replaced with its standard clsx and tailwind-merge implementation.",
-    "ToolFallback uses the host execution phase for interrupted, unexecuted, failed, and cancelled tools; missing results stay absent. Thread adds a local diagnostic disclosure using the same Base UI collapsible and button elements, with copy/download of the host-redacted report."
+    "ToolFallback uses the host execution phase for interrupted, unexecuted, failed, and cancelled tools; missing results stay absent. Thread adds a local diagnostic disclosure using the same Base UI collapsible and button elements, with copy/download of the host-redacted report.",
+    "Thread includes local workbench output cards for validated artifacts, observed sources, and actual provider usage. Existing message primitives and Markdown rendering are retained; archived file previews remain escaped text or CSV tables."
   ]
 }

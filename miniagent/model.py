@@ -25,6 +25,27 @@ class ModelReply:
     text: str
     tool_calls: list[ToolCall]
     message: dict
+    usage: dict | None = None
+
+
+def _usage(value, *, anthropic=False):
+    """Normalize optional usage without turning incomplete metadata into zero."""
+    if not isinstance(value, dict):
+        return None
+    valid = lambda number: type(number) is int and number >= 0
+    fields = {'input_tokens': 'input_tokens' if anthropic else 'prompt_tokens',
+              'output_tokens': 'output_tokens' if anthropic else 'completion_tokens',
+              'total_tokens': 'total_tokens'}
+    result = {key: value[source] for key, source in fields.items() if valid(value.get(source))}
+    if anthropic and 'input_tokens' in result:
+        cache = [value.get(key, 0) for key in ('cache_creation_input_tokens', 'cache_read_input_tokens')]
+        if all(valid(number) for number in cache):
+            result['input_tokens'] += sum(cache)
+        else:
+            result.pop('input_tokens')
+    if 'input_tokens' in result and 'output_tokens' in result:
+        result['total_tokens'] = result['input_tokens'] + result['output_tokens']
+    return result or None
 
 
 class ChatModel(Protocol):
@@ -246,6 +267,8 @@ class OpenAIModel:
             "max_completion_tokens": 4096,
             "stream": stream,
         }
+        if stream and urllib.parse.urlsplit(self.endpoint).netloc == 'api.openai.com':
+            body['stream_options'] = {'include_usage': True}
         if tools:
             body["tools"] = [{"type": "function", "function": {"name": tool["name"], "description": tool["description"], "parameters": tool["parameters"]}} for tool in tools]
         return body
@@ -285,7 +308,7 @@ class OpenAIModel:
             assistant["reasoning_content"] = reasoning
         if normalized_calls:
             assistant["tool_calls"] = normalized_calls
-        return ModelReply(content or "", calls, assistant)
+        return ModelReply(content or "", calls, assistant, _usage(payload.get('usage')))
 
     def stream(self, messages: list[dict], tools: list[dict], system_prompt: str, *, on_delta: Callable[[dict], None], should_stop: Callable[[], bool] | None = None) -> ModelReply:
         body = self._body(messages, tools, system_prompt, stream=True)
@@ -293,6 +316,7 @@ class OpenAIModel:
         calls: dict[int, dict] = {}
         reason = None
         terminal = False
+        usage = None
         diagnostic = {"phase": "stream_delta", "chunk_index": 0, "finish_reason": None}
         with _stream_events(self.endpoint, {"Authorization": f"Bearer {self._api_key}"}, body, should_stop, diagnostic=diagnostic) as events:
             for chunk_index, event in enumerate(events, 1):
@@ -303,6 +327,8 @@ class OpenAIModel:
                 diagnostic["event_type"] = "chat.completion.chunk"
                 diagnostic.pop("chunk_shape", None)
                 payload = _stream_payload(event.data)
+                if isinstance(payload.get('usage'), dict):
+                    usage = payload['usage']
                 diagnostic["chunk_shape"] = _chunk_shape(payload)
                 try:
                     choices = _typed(payload.get("choices", _MISSING), list, "choices")
@@ -369,7 +395,7 @@ class OpenAIModel:
                     raise
             message["tool_calls"] = [calls[index] for index in sorted(calls)]
         try:
-            return self._reply({"choices": [{"message": message, "finish_reason": reason}]})
+            return self._reply({"choices": [{"message": message, "finish_reason": reason}], 'usage': usage})
         except ModelError as error:
             error.diagnostic = {**diagnostic, "code": "incomplete_response", "phase": "stream_finish"}
             raise
@@ -425,7 +451,8 @@ class AnthropicModel:
         if not ((reason == "end_turn" and not calls and _nonempty(text)) or (reason == "tool_use" and calls)):
             raise ModelError("Anthropic response did not finish with complete text or tool use")
         # Replay every original block, including opaque thinking signatures.
-        return ModelReply(text, calls, {"role": "assistant", "content": blocks})
+        return ModelReply(text, calls, {"role": "assistant", "content": blocks},
+                          _usage(payload.get('usage'), anthropic=True))
 
     def stream(self, messages: list[dict], tools: list[dict], system_prompt: str, *, on_delta: Callable[[dict], None], should_stop: Callable[[], bool] | None = None) -> ModelReply:
         body = self._body(messages, tools, system_prompt, stream=True)
@@ -434,6 +461,7 @@ class AnthropicModel:
         closed = set()
         started = terminal = False
         reason = None
+        usage = {}
         headers = {"x-api-key": self._api_key, "anthropic-version": "2023-06-01"}
         diagnostic = {"phase": "stream_event", "chunk_index": 0, "finish_reason": None}
         known_events = {"message_start", "content_block_start", "content_block_delta", "content_block_stop",
@@ -452,6 +480,9 @@ class AnthropicModel:
                         if started or payload["message"].get("content") != []:
                             raise ValueError
                         started = True
+                        initial_usage = payload['message'].get('usage')
+                        if isinstance(initial_usage, dict):
+                            usage.update(initial_usage)
                     elif kind in {"content_block_start", "content_block_delta", "content_block_stop"}:
                         if not started or reason is not None:
                             raise ValueError
@@ -518,6 +549,9 @@ class AnthropicModel:
                         if finish is not None:
                             diagnostic["finish_reason"] = _finish_reason(finish)
                             reason = _string(finish)
+                        # Anthropic reports cumulative counts, not increments.
+                        if isinstance(payload.get('usage'), dict):
+                            usage.update(payload['usage'])
                     elif kind == "message_stop":
                         if not started or len(closed) != len(blocks):
                             raise ValueError
@@ -529,7 +563,8 @@ class AnthropicModel:
         if not terminal:
             raise ModelError("Anthropic stream ended before its terminal marker", diagnostic={**diagnostic, "code": "missing_terminal_marker", "phase": "stream_finish"})
         try:
-            return self._reply({"content": [blocks[index] for index in sorted(blocks)], "stop_reason": reason})
+            return self._reply({"content": [blocks[index] for index in sorted(blocks)],
+                                "stop_reason": reason, 'usage': usage})
         except ModelError as error:
             error.diagnostic = {**diagnostic, "code": "incomplete_response", "phase": "stream_finish"}
             raise

@@ -1,5 +1,6 @@
 import type { MessageStatus, ThreadAssistantMessagePart, ThreadMessageLike, ToolCallMessagePartStatus } from "@assistant-ui/react";
 import type { RunDiagnostic } from "./run-diagnostic";
+import { normalizeArtifacts, normalizeSources, normalizeMetrics, formatMetrics, unmatchedSourceReferences } from "./workbench-data";
 
 type Segment = {
   id: string;
@@ -23,11 +24,15 @@ type Message = {
   segments?: Segment[];
   segments_omitted?: number;
   diagnostic?: RunDiagnostic;
+  artifacts?: unknown;
+  sources?: unknown;
+  metrics?: unknown;
+  artifact_warning?: string;
 };
 export type ConversationInput = {
   sessionId: string | null;
   messages: Message[];
-  run?: { id: string; status: string; step?: number; error?: string | null; diagnostic?: RunDiagnostic } | null;
+  run?: { id: string; status: string; step?: number; error?: string | null; diagnostic?: RunDiagnostic; metrics?: unknown } | null;
   busy?: boolean;
 };
 export type ToolArtifact = {
@@ -42,14 +47,20 @@ const running = (status?: string) => status === "running" || status === "stoppin
 export function convertMessage(message: Message, index: number, input: ConversationInput): ThreadMessageLike {
   const id = message.run_id || `${input.sessionId || "draft"}-${message.role}-${index}`;
   if (message.role === "user") return { id, role: "user", content: message.content };
-  const isRunning = running(message.status);
+  const isElsewhere = message.status === "running_elsewhere" ||
+    (message.run_id === input.run?.id && input.run?.status === "running_elsewhere");
+  const isRunning = !isElsewhere && running(message.status);
   const report = message.diagnostic ?? (message.run_id === input.run?.id ? input.run?.diagnostic : undefined);
   const diagnostic = report?.run_id === message.run_id ? report : undefined;
-  const status: MessageStatus = isRunning ? { type: "running" }
+  const metrics = normalizeMetrics(message.metrics ?? (message.run_id === input.run?.id ? input.run?.metrics : undefined));
+  const sources = normalizeSources(message.sources);
+  const status: MessageStatus = isElsewhere ? { type: "incomplete", reason: "cancelled" }
+    : isRunning ? { type: "running" }
     : message.status === "cancelled" ? { type: "incomplete", reason: "cancelled" }
-      : message.status === "error" ? { type: "incomplete", reason: "error",
+      : ["error", "interrupted", "step_limit", "stalled", "running_elsewhere"].includes(message.status || "") ? { type: "incomplete", reason: "error",
         error: (message.run_id === input.run?.id ? input.run?.error : undefined) || diagnostic?.error?.message ||
-          "本次任务未完成，可查看本机运行记录。" }
+          (message.status === "interrupted" ? "后台已重启，任务停在上次保存的位置。" : message.status === "running_elsewhere"
+            ? "任务仍在其他启动窗口运行；这里显示上次保存的进度。" : "本次任务未完成，可查看本机运行记录。") }
         : { type: "complete", reason: "stop" };
   let segments = message.segments || [];
   let fullAnswerFallback: string | undefined;
@@ -81,8 +92,8 @@ export function convertMessage(message: Message, index: number, input: Conversat
       try { args = JSON.parse(segment.arguments || "{}"); } catch { /* Partial args remain in argsText. */ }
       if (!args || typeof args !== "object" || Array.isArray(args)) args = {};
       let phase = segment.status;
-      if (!isRunning && phase === "preparing") phase = "not_executed";
-      else if (!isRunning && phase === "running") phase = "interrupted";
+      if (!isRunning && !isElsewhere && phase === "preparing") phase = "not_executed";
+      else if (!isRunning && !isElsewhere && phase === "running") phase = "interrupted";
       // Older snapshots discarded the original execution phase on a parent error.
       // With no tool result or tool error, report the unknown outcome as interrupted.
       else if (["error", "cancelled"].includes(phase || "") &&
@@ -130,11 +141,17 @@ export function convertMessage(message: Message, index: number, input: Conversat
     metadata: {
       runId: message.run_id,
       custom: {
-        uiStatus: message.status || "completed",
+        uiStatus: isElsewhere ? "running_elsewhere" : message.status || "completed",
         step: message.run_id === input.run?.id ? input.run?.step || 0 : diagnostic?.step || 0,
         segmentsOmitted: message.segments_omitted || 0,
         fullAnswerFallback,
         diagnostic,
+        artifacts: normalizeArtifacts(message.artifacts),
+        artifactWarning: typeof message.artifact_warning === "string" ? message.artifact_warning.slice(0, 500) : undefined,
+        sources,
+        unmatchedSources: isRunning || isElsewhere ? [] : unmatchedSourceReferences(message.content, sources),
+        metrics,
+        metricsSummary: formatMetrics(metrics),
       },
     },
   };
