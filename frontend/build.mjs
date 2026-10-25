@@ -7,6 +7,7 @@ import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 
 const root = dirname(fileURLToPath(import.meta.url));
+const frontendPackage = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
 const out = resolve(root, "../web/assets");
 await mkdir(out, { recursive: true });
 const result = await build({
@@ -18,7 +19,7 @@ const result = await build({
   target: ["es2022"],
   minify: true,
   legalComments: "inline",
-  define: { "process.env.NODE_ENV": '"production"' },
+  define: { "process.env.NODE_ENV": '"production"', __FRONTEND_VERSION__: JSON.stringify(frontendPackage.version) },
   outfile: join(out, "chat.js"),
   metafile: true,
   write: false,

@@ -1,7 +1,6 @@
 """Double-click entry point: prepare one local environment, then open the web app."""
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -22,13 +21,22 @@ class NoRedirect(HTTPRedirectHandler):
 
 
 def reopen_running_app() -> bool:
-    """Reuse only this project's local server, not an unrelated service on 8765."""
+    """Reuse only this workspace's server running the current on-disk code."""
     try:
+        # main() checks the interpreter before importing the application package.
+        from miniagent.runtime import runtime_identity
+
         opener = build_opener(ProxyHandler({}), NoRedirect())
         with opener.open(URL + '/api/health', timeout=0.5) as response:
             data = json.loads(response.read(4096))
-        expected = hashlib.sha256(str(ROOT).encode()).hexdigest()[:12]
-        if isinstance(data, dict) and data.get('app') == 'minimal-agent-web' and data.get('workspace_id') == expected:
+        expected = runtime_identity(ROOT)
+        if (isinstance(data, dict) and data.get('app') == expected['app']
+                and data.get('workspace_id') == expected['workspace_id']):
+            if (data.get('version') != expected['version']
+                    or data.get('source_revision') != expected['source_revision']):
+                print(f'检测到尚未加载当前更新的旧服务，正在启动 Minimal Agent {expected["version"]}。'
+                      '原服务和正在进行的任务会继续保留。', flush=True)
+                return False
             print(f'Minimal Agent is already running: {URL}', flush=True)
             webbrowser.open(URL)
             return True

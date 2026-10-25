@@ -9,6 +9,7 @@ import {
 import { Thread } from "./components/assistant-ui/elements/thread.aui";
 import { convertMessage, type ConversationInput } from "./message-adapter";
 export { stopCurrentRun } from "./stop-run";
+export { FRONTEND_VERSION, assessRuntimeCompatibility, createRuntimeDiagnostic } from "./runtime-compatibility";
 type Message = ConversationInput["messages"][number];
 
 type Snapshot = {

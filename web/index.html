@@ -47,6 +47,11 @@
         <div class="header-actions"><button class="button quiet trace-toggle" id="open-trace" hidden><svg class="icon"><use href="#i-trace"/></svg><span>运行记录</span></button><button class="button quiet tools-toggle" id="open-tools"><svg class="icon"><use href="#i-code"/></svg><span>工具</span></button><button class="button quiet files-toggle" id="open-files"><svg class="icon"><use href="#i-folder"/></svg><span>工作文件</span><span class="count" id="file-count">0</span></button></div>
       </header>
       <div class="model-line" id="model-line" hidden></div>
+      <section class="runtime-banner" id="runtime-banner" role="alert" aria-labelledby="runtime-warning-title" hidden>
+        <strong id="runtime-warning-title"></strong>
+        <p>请重新双击 Start，打开新版页面；刷新此旧页面不会更新后台。</p>
+        <div class="runtime-banner-footer"><span id="runtime-versions"></span><div class="runtime-actions"><button class="text-button" id="recheck-runtime" type="button">重新检查</button><button class="text-button" id="copy-runtime-diagnostic" type="button">复制运行诊断</button></div></div>
+      </section>
       <div class="connection-banner" id="connection-banner" role="alert" hidden></div>
 
       <section class="conversation" id="conversation" aria-label="对话内容">
@@ -66,7 +71,7 @@
           <textarea id="message-input" rows="3" maxlength="59000" placeholder="描述你想完成的任务…"></textarea>
           <div class="composer-toolbar"><button class="attach-button" type="button" id="attach-file"><svg class="icon"><use href="#i-clip"/></svg><span>添加文件</span></button><button class="send-button" id="send-button" type="submit" aria-label="发送消息"><svg class="icon"><use href="#i-send"/></svg></button></div>
         </form>
-        <p class="keyboard-hint">Enter 发送 · Shift + Enter 换行</p>
+        <p class="keyboard-hint">Enter 发送 · Shift + Enter 换行<span class="runtime-version" id="runtime-version"></span></p>
       </div>
     </main>
   </div>

@@ -1,4 +1,5 @@
-import { mountConversation, stopCurrentRun } from "./assets/chat.js";
+import { mountConversation, stopCurrentRun, FRONTEND_VERSION,
+  assessRuntimeCompatibility, createRuntimeDiagnostic } from "./assets/chat.js";
 
 "use strict";
 
@@ -12,6 +13,7 @@ const state = {
   chat: null, traceSignature: "", toastTimer: null,
   toolInventory: { tools: [], saved_tools: [], tool_errors: [] },
   toolsRequest: 0, toolsRun: null, searchKeyRemoved: false,
+  runtimeCompatibility: null, runtimeCheckedAt: null, checkingRuntime: false, runtimeError: null,
 };
 const active = (run) => run && ["running", "stopping"].includes(run.status);
 const busy = () => state.sending || state.uploading || state.selecting;
@@ -68,6 +70,52 @@ function formError(id, message) {
 function connectionError(message) {
   $("connection-banner").textContent = message || "";
   $("connection-banner").hidden = !message;
+}
+
+function renderRuntime() {
+  const compatibility = state.runtimeCompatibility;
+  const blocked = Boolean(compatibility?.blocksNewRuns);
+  const backendVersion = compatibility?.backend.version;
+  $("runtime-banner").hidden = !blocked;
+  $("runtime-warning-title").textContent = compatibility?.status === "version_mismatch"
+    ? "页面与后台版本不一致，已暂停发送新任务。" : "无法确认后台版本，已暂停发送新任务。";
+  $("runtime-versions").textContent = `页面 v${FRONTEND_VERSION} · 后台 ${backendVersion ? `v${backendVersion}` : "未知"}`;
+  $("runtime-version").textContent = blocked ? $("runtime-versions").textContent
+    : backendVersion ? `v${backendVersion}` : state.checkingRuntime ? "版本检查中…" : "后台版本待确认";
+  $("recheck-runtime").disabled = state.checkingRuntime;
+  $("recheck-runtime").textContent = state.checkingRuntime ? "检查中…" : "重新检查";
+}
+
+async function checkRuntime(bootstrap) {
+  if (state.checkingRuntime) return;
+  state.checkingRuntime = true; renderRuntime();
+  try {
+    // Old services do not include their identity in bootstrap. Ask their
+    // existing health route once; never infer a mismatch from a failed request.
+    const runtime = bootstrap && Object.hasOwn(bootstrap, "runtime")
+      ? bootstrap.runtime : await api("/api/health");
+    state.runtimeCompatibility = assessRuntimeCompatibility(runtime);
+    state.runtimeCheckedAt = new Date().toISOString();
+    if (state.runtimeError && $("connection-banner").textContent === state.runtimeError) connectionError("");
+    state.runtimeError = null;
+    return state.runtimeCompatibility;
+  } catch (error) {
+    state.runtimeError = error.message;
+    connectionError(error.message);
+  } finally {
+    state.checkingRuntime = false; renderRuntime(); renderRun();
+  }
+}
+
+async function copyRuntimeDiagnostic() {
+  if (!state.runtimeCompatibility) return;
+  const report = createRuntimeDiagnostic(state.runtimeCompatibility, {
+    pageOrigin: window.location.origin, checkedAt: state.runtimeCheckedAt,
+  });
+  try {
+    await navigator.clipboard.writeText(JSON.stringify(report, null, 2));
+    toast("运行诊断已复制，不含聊天内容或密钥。");
+  } catch { toast("复制未成功，请检查浏览器的剪贴板权限后重试。"); }
 }
 
 function saveDraft() {
@@ -259,6 +307,9 @@ function renderMessages() {
     state.chat = mountConversation($("messages"), {
       send: async (text) => {
         if (busy() || active(state.session?.run)) return;
+        if (state.runtimeCompatibility?.blocksNewRuns) {
+          toast("请重新双击 Start，在新版页面中发送任务。"); return;
+        }
         $("message-input").value = text;
         await sendMessage({ preventDefault() {} });
       },
@@ -275,7 +326,8 @@ function renderRun() {
   $("open-trace").hidden = !run;
   const button = $("send-button");
   button.classList.toggle("stopping", run?.status === "stopping");
-  button.disabled = busy() || !state.initialized || run?.status === "stopping";
+  button.disabled = busy() || !state.initialized || run?.status === "stopping" ||
+    (!running && Boolean(state.runtimeCompatibility?.blocksNewRuns));
   button.setAttribute("aria-label", running ? "停止运行" : "发送消息");
   button.replaceChildren(icon(running ? "stop" : "send"));
   $("run-status").hidden = !running && !state.sending;
@@ -533,6 +585,9 @@ async function sendMessage(event) {
   if (busy()) return;
   if (active(state.session?.run)) { await stopRun(); return; }
   if (state.sending || !state.initialized) return;
+  if (state.runtimeCompatibility?.blocksNewRuns) {
+    toast("请重新双击 Start，在新版页面中发送任务。"); return;
+  }
   const text = $("message-input").value.trim();
   if (!text && !state.attachments.length) { $("message-input").focus(); return; }
   if (!state.config.configured && !state.session) { openSettings(); return; }
@@ -709,6 +764,11 @@ async function uploadFiles() {
 
 function bindEvents() {
   window.addEventListener("beforeunload", closeStream);
+  $("recheck-runtime").addEventListener("click", async () => {
+    const compatibility = await checkRuntime();
+    if (compatibility?.status === "compatible") toast("页面与后台版本一致，可以继续发送任务。");
+  });
+  $("copy-runtime-diagnostic").addEventListener("click", copyRuntimeDiagnostic);
   $("new-chat").addEventListener("click", newChat);
   $("open-settings").addEventListener("click", openSettings);
   $("settings-form").addEventListener("submit", saveSettings);
@@ -781,10 +841,11 @@ function bindEvents() {
 }
 
 async function initialize() {
-  bindEvents(); renderSessions(); renderRun();
+  bindEvents(); renderSessions(); renderRuntime(); renderRun();
   try {
     const result = await api("/api/bootstrap");
     state.config = result.config; state.sessions = result.sessions; state.files = result.files;
+    await checkRuntime(result);
     state.initialized = true; renderConfig(); renderSessions(); renderFiles(); renderRun();
     if (state.sessions.length) await selectSession(state.sessions[0].id);
   } catch (error) { connectionError(error.message); }

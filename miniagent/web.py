@@ -6,7 +6,6 @@ from collections import deque
 import copy
 from datetime import datetime, timezone
 import errno
-import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
@@ -25,6 +24,7 @@ from .config import _Config, load_agent
 from .diagnostics import diagnostic_fields, exception_diagnostic, write_diagnostic
 from .model import AnthropicModel, OpenAIModel
 from .programming import ProgrammingTools
+from .runtime import runtime_identity
 from .search import build_search_tools
 from .tracing import JsonlTrace
 
@@ -331,6 +331,9 @@ class RunPresentation:
 class WebState:
     def __init__(self, root):
         self.root = root.resolve()
+        # Freeze the identity of this process. Static browser assets may change
+        # on disk after an update while these Python modules remain loaded.
+        self.runtime = runtime_identity(self.root)
         self.workspace = self.root / 'workspace'
         self.workspace.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
@@ -476,6 +479,7 @@ class WebState:
                       config.search_api_key.get_secret_value().strip()),
                   'created_at': timestamp, 'updated_at': timestamp, 'messages': [], 'run': None}
         self.sessions[sid] = {'detail': detail, 'agent': agent,
+                              'runtime': dict(self.runtime),
                               'endpoint': self.model(config).endpoint,
                               'secret': [config.api_key.get_secret_value(),
                                          config.search_api_key.get_secret_value() if config.search_api_key else ''],
@@ -616,6 +620,7 @@ class WebState:
             error_message = f"Unexpected {error.get('type', 'error')} during {error.get('phase', 'agent_run')}."
         report = {
             'schema_version': 1, 'app_version': __version__,
+            'runtime': session['runtime'],
             'run_id': run['id'], 'session_id': detail['id'],
             'started_at': run['started_at'], 'finished_at': detail['updated_at'],
             'status': run['status'], 'step': run['step'],
@@ -784,12 +789,12 @@ class Handler(BaseHTTPRequestHandler):
             if path == '/favicon.ico':
                 return 204, b'', 'image/x-icon'
             if path == '/api/health':
-                result = {'app': 'minimal-agent-web', 'version': __version__,
-                          'workspace_id': hashlib.sha256(str(state.root).encode()).hexdigest()[:12]}
+                result = state.runtime
             elif path in {'/api/bootstrap', '/api/config'}:
                 result = {'config': state.masked_config()}
                 if path == '/api/bootstrap':
-                    result.update(sessions=state.summaries(), files=state.files(), **state.tool_inventory())
+                    result.update(runtime=state.runtime, sessions=state.summaries(),
+                                  files=state.files(), **state.tool_inventory())
             elif path == '/api/tools':
                 result = state.tool_inventory()
             elif path == '/api/sessions':

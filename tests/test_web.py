@@ -69,6 +69,32 @@ class WebTests(unittest.TestCase):
             self.assertEqual(self.configure(api_key='', **change)[0], 400)
         self.assertNotIn('secret-not-for-browser', json.dumps(self.request('GET', '/api/config')[1]))
 
+    def test_health_and_bootstrap_identify_the_loaded_runtime_after_files_change(self):
+        status, original = self.request('GET', '/api/health')
+        self.assertEqual(status, 200)
+        self.assertIn('source_revision', original,
+                      'Health cannot distinguish loaded Python from updated files')
+        self.assertEqual(self.request('GET', '/api/bootstrap')[1]['runtime'], original)
+        package = self.root / 'miniagent'
+        package.mkdir()
+        (package / 'model.py').write_text('UPDATED_ON_DISK = True\n', encoding='utf-8')
+        from miniagent.runtime import runtime_identity
+        self.assertNotEqual(runtime_identity(self.root)['source_revision'], original['source_revision'])
+        self.assertEqual(self.request('GET', '/api/health')[1], original)
+        self.assertEqual(self.request('GET', '/api/bootstrap')[1]['runtime'], original)
+
+    def test_failure_diagnostic_includes_the_loaded_backend_identity(self):
+        self.configure()
+        sid = self.session()
+        health = self.request('GET', '/api/health')[1]
+        with patch.object(OpenAIModel, 'stream', side_effect=RuntimeError('failed')):
+            self.request('POST', f'/api/sessions/{sid}/messages', {'message': 'hello'})
+            detail = self.wait_done(sid)
+        report = detail['messages'][-1]['diagnostic']
+        self.assertIn('runtime', report, 'Failure report cannot identify the running build')
+        self.assertEqual(report['runtime'], health)
+        self.assertNotIn('secret-not-for-browser', json.dumps(report))
+
     def test_invalid_config_is_not_saved_or_echoed(self):
         for changes in ({'provider': 'secret-not-for-browser'}, {'base_url': 'ftp://secret-not-for-browser'},
                         {'model': ''}, {'unknown': 'secret-not-for-browser'}):

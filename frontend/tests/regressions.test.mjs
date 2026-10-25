@@ -3,15 +3,20 @@ import { test } from "node:test";
 import { build } from "esbuild";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readFile } from "node:fs/promises";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const frontendPackage = JSON.parse(await readFile(resolve(root, "package.json"), "utf8"));
 async function productionModule(file) {
   const result = await build({ entryPoints: [resolve(root, file)], bundle: true,
-    format: "esm", platform: "node", write: false });
+    format: "esm", platform: "node", write: false,
+    define: { __FRONTEND_VERSION__: JSON.stringify(frontendPackage.version) } });
   return import(`data:text/javascript;base64,${Buffer.from(result.outputFiles[0].contents).toString("base64")}`);
 }
 const { convertMessage } = await productionModule("src/message-adapter.ts");
 const { stopCurrentRun } = await productionModule("src/stop-run.ts");
+const { FRONTEND_VERSION, assessRuntimeCompatibility, createRuntimeDiagnostic } =
+  await productionModule("src/runtime-compatibility.ts");
 const context = (message, error) => ({ sessionId: "session", messages: [message],
   run: { id: message.run_id, status: message.status, step: 2, error } });
 
@@ -173,4 +178,64 @@ test("a current stop request still applies its acknowledged state", async () => 
   await fixture.work;
   assert.equal(fixture.read().status, "stopping");
   assert.deepEqual(fixture.applied, [{ accepted: true }]);
+});
+
+test("a matching backend permits new model runs using the version embedded at build time", () => {
+  const result = assessRuntimeCompatibility({ app: "minimal-agent-web", version: frontendPackage.version,
+    workspace_id: "123456abcdef", source_revision: "a".repeat(64) });
+  assert.equal(FRONTEND_VERSION, frontendPackage.version);
+  assert.equal(result.status, "compatible");
+  assert.equal(result.blocksNewRuns, false);
+});
+
+test("an older service blocks new model runs even when it has the expected application identity", () => {
+  const result = assessRuntimeCompatibility({ app: "minimal-agent-web", version: "0.4.0",
+    workspace_id: "123456abcdef" }, "0.4.2");
+  assert.equal(result.status, "version_mismatch");
+  assert.equal(result.blocksNewRuns, true);
+  assert.equal(result.backend.version, "0.4.0", "the displayed version must come from the running service");
+  assert.equal(result.frontendVersion, "0.4.2");
+});
+
+test("missing or invalid service identity never passes a version match", () => {
+  for (const runtime of [null, {}, { version: "0.4.2" }, { app: "another-app", version: "0.4.2" },
+    { app: "minimal-agent-web", version: 42 }, { app: "minimal-agent-web", version: "" },
+    { app: "minimal-agent-web", version: "0.4.2\nsecret" }, { app: "minimal-agent-web", version: "0.4.2\n" }]) {
+    const result = assessRuntimeCompatibility(runtime, "0.4.2");
+    assert.equal(result.status, "invalid_identity");
+    assert.equal(result.blocksNewRuns, true);
+  }
+});
+
+test("optional legacy revision metadata does not reject an otherwise matching service", () => {
+  const result = assessRuntimeCompatibility({ app: "minimal-agent-web", version: "0.4.2" }, "0.4.2");
+  assert.equal(result.blocksNewRuns, false);
+  assert.equal(result.backend.source_revision, null);
+  assert.equal(result.backend.workspace_id, null);
+});
+
+test("copied runtime diagnostics contain only version identity and the page origin", () => {
+  const compatibility = assessRuntimeCompatibility({ app: "minimal-agent-web", version: "0.4.0",
+    workspace_id: "123456abcdef", source_revision: "b".repeat(64),
+    config: { api_key: "secret-key", model: "private-model" },
+    messages: [{ content: "private conversation" }], root: "/home/private/workspace" }, "0.4.2");
+  const report = createRuntimeDiagnostic(compatibility, {
+    pageOrigin: "http://user:secret-password@127.0.0.1:8765/private?token=secret-query#private-fragment",
+    checkedAt: "2026-10-25T12:34:56.000Z",
+  });
+  assert.deepEqual(report, { schema_version: 1, kind: "minimal-agent-runtime",
+    frontend_version: "0.4.2", compatibility: "version_mismatch",
+    backend: { app: "minimal-agent-web", version: "0.4.0", workspace_id: "123456abcdef", source_revision: "b".repeat(64) },
+    page_origin: "http://127.0.0.1:8765", checked_at: "2026-10-25T12:34:56.000Z" });
+  assert.doesNotMatch(JSON.stringify(report), /secret|private/);
+});
+
+test("unexpected metadata is omitted from safe runtime diagnostics", () => {
+  const compatibility = assessRuntimeCompatibility({ app: "secret-app", version: "secret-key",
+    workspace_id: "/home/private/workspace", source_revision: "secret-token" }, "0.4.2");
+  const report = createRuntimeDiagnostic(compatibility, { pageOrigin: "file:///home/private/index.html", checkedAt: "secret" });
+  assert.deepEqual(report.backend, { app: null, version: null, workspace_id: null, source_revision: null });
+  assert.equal(report.page_origin, null);
+  assert.equal(report.checked_at, null);
+  assert.doesNotMatch(JSON.stringify(report), /secret|private/);
 });
