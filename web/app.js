@@ -1,5 +1,6 @@
-import { mountConversation, stopCurrentRun, FRONTEND_VERSION,
-  assessRuntimeCompatibility, createRuntimeDiagnostic, normalizeArtifacts, formatMetrics } from "./assets/chat.js";
+import { mountConversation, stopCurrentRun, submitRunInput, directionRequest, FRONTEND_VERSION,
+  assessRuntimeCompatibility, createRuntimeDiagnostic, normalizeArtifacts, formatMetrics,
+  normalizeWorkPlan, normalizeSteering, directionStatus, normalizeSources, readablePlanEvidence } from "./assets/chat.js";
 
 "use strict";
 
@@ -16,6 +17,7 @@ const state = {
   runtimeCompatibility: null, runtimeCheckedAt: null, checkingRuntime: false, runtimeError: null,
   storageWarning: null, connectionCheck: null, checkRequest: 0, checkResults: {},
   toolBusy: new Set(), toolTestResults: new Map(), artifactRequest: 0, artifactPreview: null,
+  steeringSending: false, steeringRequests: new Map(), planSignature: "", planSession: null,
 };
 const active = (run) => run && ["running", "stopping"].includes(run.status);
 const busy = () => state.sending || state.uploading || state.selecting;
@@ -417,16 +419,77 @@ function renderRunMetrics() {
   $("run-metrics").hidden = !text || !active(run);
 }
 
+function renderWorkPlan() {
+  const session = state.session, run = session?.run;
+  const currentMessage = runMessage(run?.id);
+  const plan = normalizeWorkPlan(currentMessage?.work_plan || session?.work_plan);
+  const sources = normalizeSources(currentMessage?.sources);
+  const inputs = normalizeSteering(session?.steering);
+  const signature = JSON.stringify([session?.id, plan, inputs, run?.id, run?.status, sources]);
+  if (state.planSignature === signature) return;
+  state.planSignature = signature;
+  if (state.planSession !== session?.id) { $("work-plan-details").open = false; state.planSession = session?.id; formError("composer-error", ""); }
+  $("work-plan-panel").hidden = !plan;
+  if (plan) {
+    $("work-plan-label").textContent = currentMessage?.work_plan ? "当前目标" : "最近一次目标";
+    $("work-plan-goal").textContent = plan.goal;
+    const current = plan.steps.find((step) => step.status === "in_progress") || plan.steps.find((step) => step.status === "pending");
+    $("work-plan-current-step").textContent = current ? `当前步骤 · ${current.title}` : "计划步骤已完成，结合结果检查完成标准。";
+    $("work-plan-check").textContent = `模型自检：${plan.verification.status === "passed" ? "认为已满足标准" : plan.verification.status === "needs_work" ? "仍需完善" : "尚未检查"}`;
+    $("work-plan-check").dataset.verification = plan.verification.status;
+    const body = $("work-plan-body"); body.replaceChildren();
+    const addList = (title, items) => {
+      if (!items.length) return;
+      const group = node("section", "work-plan-group"), list = node("ul", "");
+      for (const item of items) list.append(node("li", "", item));
+      group.append(node("h4", "", title), list); body.append(group);
+    };
+    addList("完成标准", plan.success_criteria);
+    const steps = node("ol", "work-plan-steps");
+    for (const [index, step] of plan.steps.entries()) {
+      const item = node("li", ""); item.dataset.stepStatus = step.status;
+      item.append(node("span", "step-marker", step.status === "completed" ? "✓" : String(index + 1)),
+        node("span", "step-title", step.title), node("small", "", step.status === "completed" ? "已完成" : step.status === "in_progress" ? "进行中" : "待处理"));
+      steps.append(item);
+    }
+    const stepsGroup = node("section", "work-plan-group"); stepsGroup.append(node("h4", "", "计划与进度"), steps); body.append(stepsGroup);
+    if (plan.summary) { const summary = node("section", "work-plan-group"); summary.append(node("h4", "", "当前判断"), node("p", "", readablePlanEvidence(plan.summary, sources))); body.append(summary); }
+    addList("依据与观察", plan.evidence.map((item) => readablePlanEvidence(item, sources))); addList("仍需确认", plan.uncertainties.map((item) => readablePlanEvidence(item, sources)));
+    const check = node("section", "work-plan-group work-plan-verification");
+    check.append(node("h4", "", "模型自检"), node("p", "", readablePlanEvidence(plan.verification.summary, sources) || "尚未给出检查结论。"),
+      node("small", "", "这是模型公开的判断摘要，可结合工具结果和来源核对。")); body.append(check);
+  }
+  const receipts = $("steering-receipts"); receipts.replaceChildren();
+  const recent = inputs.filter((input) => input.run_id === run?.id || input.status === "pending").slice(-3);
+  receipts.hidden = !recent.length;
+  for (const input of recent) {
+    const row = node("div", "steering-receipt"); row.dataset.inputId = input.id; row.dataset.status = input.status;
+    row.append(node("span", "steering-receipt-state", directionStatus(input, run)), node("span", "steering-receipt-text", input.message));
+    row.title = input.message; receipts.append(row);
+  }
+}
+
 function renderRun() {
   const run = state.session?.run;
   const running = active(run);
   $("open-trace").hidden = !run;
   const button = $("send-button");
-  button.classList.toggle("stopping", run?.status === "stopping");
-  button.disabled = busy() || !state.initialized || run?.status === "stopping" ||
+  button.classList.toggle("steering", running);
+  button.disabled = busy() || state.steeringSending || !state.initialized || run?.status === "stopping" || (running && run.accepting_input === false) ||
     (!running && (Boolean(state.runtimeCompatibility?.blocksNewRuns) || state.session?.resume_available === false));
-  button.setAttribute("aria-label", running ? "停止运行" : "发送消息");
-  button.replaceChildren(icon(running ? "stop" : "send"));
+  button.setAttribute("aria-label", running ? "补充或纠正方向" : "发送消息");
+  button.replaceChildren(icon("send"));
+  if (running) button.append(node("span", "", state.steeringSending ? "正在提交…" : "纠正方向"));
+  $("stop-button").hidden = !running;
+  $("stop-button").disabled = busy() || run?.status === "stopping";
+  $("stop-button").classList.toggle("stopping", run?.status === "stopping");
+  $("stop-button").querySelector("span").textContent = run?.status === "stopping" ? "正在停止…" : "停止";
+  $("steering-hint").hidden = !running;
+  $("steering-hint").textContent = run?.status === "stopping" ? "正在停止，尚未应用的补充会保留到下次继续。"
+    : run?.accepting_input === false ? "本轮正在收尾，输入内容可在完成后作为下一条消息发送。"
+      : "可以补充目标、约束或纠正方向；当前工具结束后应用。";
+  $("keyboard-action-hint").textContent = running ? "Enter 提交方向调整 · Shift + Enter 换行" : "Enter 发送 · Shift + Enter 换行";
+  $("message-input").placeholder = running ? "补充目标、约束或纠正当前方向…" : "描述你想完成的任务…";
   $("run-status").hidden = !running && !state.sending;
   if (state.sending && !running) $("run-status").textContent = "正在提交任务…";
   else if (run?.status === "stopping") $("run-status").textContent = "正在停止当前任务…";
@@ -437,10 +500,10 @@ function renderRun() {
     $("run-status").textContent = run.phase ? phases[run.phase] || "正在处理…" : last?.event === "tool_call"
       ? `正在执行 ${last.data.name}…` : `正在处理${run.step ? ` · 第 ${run.step} 步` : ""}…`;
   }
-  renderRecovery(); renderRunMetrics();
+  renderRecovery(); renderRunMetrics(); renderWorkPlan();
   // Freeze state changes while a local send, upload, or session switch is pending.
   // Once the POST is acknowledged, a running model does not block drafting the next turn.
-  $("message-input").readOnly = state.sending || state.selecting;
+  $("message-input").readOnly = state.sending || state.selecting || state.steeringSending;
   for (const id of ["new-chat", "open-settings", "open-files", "open-tools", "attach-file",
     "summarize-file", "create-tool-prompt", "search-web-prompt", "upload-files"]) $(id).disabled = busy();
   $("session-list").querySelectorAll("button").forEach((item) => { item.disabled = busy(); });
@@ -614,7 +677,7 @@ function connectStream(id, revision) {
     const status = active(data) ? data.status : state.session.run.status;
     Object.assign(state.session.run, { status, step: data.step, error: data.error,
       event_count: data.event_count, omitted_events: data.omitted_events });
-    for (const key of ["metrics", "phase", "last_activity_at", "finished_at", "storage_warning"]) {
+    for (const key of ["metrics", "phase", "last_activity_at", "finished_at", "storage_warning", "accepting_input"]) {
       if (Object.hasOwn(data, key)) state.session.run[key] = data[key];
     }
     const message = runMessage(data.run_id);
@@ -700,13 +763,14 @@ function newChat() {
 
 async function sendMessage(event) {
   event.preventDefault();
-  if (busy()) return;
-  if (active(state.session?.run)) { await stopRun(); return; }
+  if (busy() || state.steeringSending) return;
+  if (active(state.session?.run)) { await sendDirection(); return; }
   if (state.sending || !state.initialized) return;
   if (state.runtimeCompatibility?.blocksNewRuns) {
     toast("请重新双击 Start，在新版页面中发送任务。"); return;
   }
   if (state.session?.resume_available === false) { toast(state.session.resume_reason || "当前会话暂时无法继续。"); return; }
+  formError("composer-error", "");
   const text = $("message-input").value.trim();
   if (!text && !state.attachments.length) { $("message-input").focus(); return; }
   if (!state.config.configured && !state.session) { openSettings(); return; }
@@ -743,6 +807,52 @@ async function sendMessage(event) {
       await recoverSession(targetId, revision);
     }
   } finally { state.sending = false; renderRun(); }
+}
+
+async function sendDirection() {
+  if (busy() || state.steeringSending) return;
+  const session = state.session, run = session?.run;
+  if (!session || run?.status !== "running" || run.accepting_input === false) return;
+  const draft = $("message-input").value, text = draft.trim(), attachments = [...state.attachments];
+  if (!text && !attachments.length) { $("message-input").focus(); return; }
+  const message = (text || "请将这些文件纳入当前任务。") + (attachments.length
+    ? `\n\n附加的工作区文件（可使用 read_file 读取）：\n${attachments.map((name) => `- ${JSON.stringify(name)}`).join("\n")}` : "");
+  if (message.length > 8000) { formError("composer-error", "补充或纠正内容最多 8000 个字符，请缩短后重试。"); return; }
+  const read = () => ({ sessionId: state.session?.id || null, runId: state.session?.run?.id || null,
+    revision: state.revision, status: state.session?.run?.status, acceptingInput: state.session?.run?.accepting_input });
+  const key = `${session.id}:${run.id}`;
+  const request = directionRequest(state.steeringRequests.get(key) || null, read(), message, () => crypto.randomUUID());
+  state.steeringRequests.set(key, request);
+  state.steeringSending = true; formError("composer-error", ""); renderRun();
+  try {
+    await submitRunInput({ read, inputId: request.inputId, message,
+      request: ({ sessionId, runId, inputId, message }) => api(`/api/sessions/${encodeURIComponent(sessionId)}/steer`, { run_id: runId, input_id: inputId, message }),
+      apply: (result) => {
+        const inputs = normalizeSteering([result.input]);
+        if (!inputs.length) throw new Error("补充已提交，但未收到有效回执；保留草稿以便核对。");
+        const accepted = inputs[0];
+        if (accepted.id !== request.inputId || accepted.run_id !== run.id) throw new Error("收到不属于当前方向调整的回执，草稿已保留。");
+        // An SSE acknowledgement may already be newer than this HTTP response.
+        state.session.steering ||= [];
+        const previous = state.session.steering.find((input) => input.id === accepted.id);
+        if (!previous) state.session.steering.push(accepted);
+        else if (previous.status !== "applied") Object.assign(previous, accepted);
+        const currentMessage = runMessage(run.id);
+        if (currentMessage) currentMessage.steering = state.session.steering.filter((input) => input.run_id === run.id);
+        if ($("message-input").value === draft) {
+          $("message-input").value = ""; state.attachments = []; state.drafts.delete(session.id);
+          resizeInput(); renderAttachments(); renderFiles();
+        }
+        state.steeringRequests.delete(key);
+        state.planSignature = ""; renderMessages(); renderRun();
+      },
+      recover: async (error) => {
+        formError("composer-error", error.message || "提交失败，草稿已保留。");
+        // A lost HTTP response may still have accepted the durable input. Reusing
+        // input_id makes an unchanged retry safe; snapshots reveal its real state.
+      },
+    });
+  } finally { state.steeringSending = false; renderRun(); }
 }
 
 async function continueSession() {
@@ -1079,11 +1189,12 @@ function bindEvents() {
     });
   });
   $("message-form").addEventListener("submit", sendMessage);
+  $("stop-button").addEventListener("click", stopRun);
   $("message-input").addEventListener("input", () => { resizeInput(); saveDraft(); });
   $("message-input").addEventListener("keydown", (event) => {
     if (event.key === "Enter" && !event.shiftKey && !event.isComposing && event.keyCode !== 229) {
       event.preventDefault();
-      if (!active(state.session?.run)) $("message-form").requestSubmit();
+      $("message-form").requestSubmit();
     }
   });
   $("open-files").addEventListener("click", openFiles);

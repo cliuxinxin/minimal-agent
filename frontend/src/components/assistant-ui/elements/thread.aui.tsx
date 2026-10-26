@@ -28,6 +28,7 @@ import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
 import type { ToolArtifact } from "@/message-adapter";
 import { DiagnosticDisclosure } from "./diagnostic-disclosure";
 import { WorkbenchOutput } from "./workbench-output";
+import { WorkPlanSnapshot } from "./work-plan";
 
 const groupBy = groupPartByType({ reasoning: ["group-reasoning"] });
 
@@ -113,21 +114,21 @@ function MessageNotice() {
 }
 
 function FullAnswer() {
-  const answer = useAuiState((s) => s.message.metadata.custom.fullAnswerFallback);
+  const answer = useAuiState((s) => s.message.metadata.custom.readableFullAnswer);
   if (typeof answer !== "string") return null;
   return (
     <CollapsibleRoot className="full-answer-disclosure">
-      <CollapsibleTrigger>查看完整最终回复（Markdown 原文）</CollapsibleTrigger>
+      <CollapsibleTrigger>查看完整最终回复（Markdown）</CollapsibleTrigger>
       <CollapsibleContent><pre>{answer}</pre></CollapsibleContent>
     </CollapsibleRoot>
   );
 }
 
 function CopyAnswer() {
-  const answer = useAuiState((s) => s.message.metadata.custom.fullAnswerFallback);
+  const answer = useAuiState((s) => s.message.metadata.custom.copyAnswer);
   const { isCopied, copyToClipboard } = useCopyToClipboard();
   if (typeof answer === "string") {
-    return <TooltipIconButton tooltip="复制完整回复" onClick={() => copyToClipboard(answer)}>
+    return <TooltipIconButton tooltip="复制完整回复" data-testid="copy-answer" onClick={() => copyToClipboard(answer)}>
       {isCopied ? <CheckIcon /> : <CopyIcon />}
     </TooltipIconButton>;
   }
@@ -177,6 +178,9 @@ function AssistantMessage() {
               case "tool-call": {
                 const artifact = part.artifact as ToolArtifact | undefined;
                 const toolStatus = artifact?.displayStatus ?? part.status;
+                if (part.toolName === "update_work_plan") return <p className="plan-update-note" data-status={artifact?.phase}>
+                  {artifact?.phase === "completed" ? "目标与计划已更新" : ["running", "preparing"].includes(artifact?.phase || "") ? "正在整理目标与计划…" : "本次目标更新未完成"}
+                </p>;
                 return (
                   <div className="inline-tool" data-status={artifact?.phase} data-segment-id={artifact?.segmentId}>
                     <ToolFallback {...part} status={toolStatus} />
@@ -193,6 +197,7 @@ function AssistantMessage() {
         </MessagePrimitive.GroupedParts>
         <FullAnswer />
         <MessageNotice />
+        <WorkPlanSnapshot />
         <WorkbenchOutput />
         <DiagnosticDisclosure />
         <ActionBarPrimitive.Root hideWhenRunning autohide="not-last" className="aui-assistant-action-bar">

@@ -191,3 +191,21 @@ assistant 消息可包含 `artifacts`、`sources`、`metrics`。来源由实际�
 create_tool 保留原有 example_arguments/expected_result，新增可选 `tests`（最多 20 组附加样例）与 `input_schema`。支持对象字段、required/additionalProperties、数组 items、基本类型、enum、字符串／数组／数值边界；不支持的 schema 关键字会拒绝。所有样例通过后才发布新版本。单样例通过只证明该样例，不代表程序全面正确。
 
 运行 `python -m unittest discover -s tests -v` 检查程序边界。新增工具需验证正常输入、错误输入，以及写工具审批拒绝时不执行；模型替身只留在测试里。再用配置的真实模型核对工具轨迹和可独立计算的预期结果。交付未使用你的凭据完成真实 API 联调。
+
+## v0.6.0 公开计划与运行中纠偏
+
+应用装配通过 `Agent(..., planning=True)` 注册 `update_work_plan`。直接构造 `Agent` 的默认值仍是 `False`，便于扩展者决定自己的工具集合；网页配置不增加开关。`miniagent/planning.py` 定义严格、有界的 `WorkPlanArgs`：goal、success_criteria、steps、summary、evidence、uncertainties、verification。revision 和 updated_at 由宿主分配；输入完全相同时保持版本不变，防止反复改写同一计划绕过原有空转保护。
+
+`Agent.work_plan` 保存最新计划，后续请求把它作为可能过时的工作数据注入上下文，最新用户要求优先。`work_plan` 事件的 `data.plan` 更新公开界面；内部 `checkpoint` 保证恢复。页面和每条 assistant 消息分别保存当前状态与该轮快照。模型摘要是面向用户的判断说明，verification 是模型自检；不把这些字段视为工具执行成功或业务正确性的证明。
+
+`POST /api/sessions/{id}/steer` 接收 `{run_id, input_id, message}`，成功返回 202 和 `{input, session}`。input_id 为 1–64 个字母、数字、下划线或连字符；message 为 1–8000 字符。同一 ID、run 和原文重试保持幂等，复用 ID 修改内容返回 409。过期、停止、其他后台占用、已关闭输入的运行返回 409；最多 10 条待应用输入、每轮 100 条已接收输入，超出返回 429。存储失败返回 503，不能将内容加入可执行队列后误报成功。
+
+`detail.steering` 和消息内 steering 使用 `{id, run_id, message, status: pending|applied, created_at, applied_at?}`。原始队列单独持久化；公开文字在接收时脱敏并保留，恢复时不会因原密钥已不可用而重新暴露原文。HTTP 只排队，不能修改原生模型历史。
+
+Runner 的 `run(task, should_stop=..., pending_input=...)` 接受 `pending_input(final=False)` 回调，返回 `{id,message,before_task?}`。读取队列不确认消费。runner 在安全边界追加原生用户消息，随后更新 `applied_input_ids`、发出 `input_applied` 和检查点。网页 Agent 的 `state_lock` 与 WebState 使用同一个 RLock；历史、归档、已应用 ID 和确认状态在同一锁内提交，网络与工具执行在锁外。
+
+纠偏在模型请求前、模型返回后和每个工具执行前检查。正在执行的工具完成后，剩余旧方向调用获得 `superseded_by_user` 错误结果，页面显示未执行；所有原生调用／结果配对完整后才插入用户消息。最终文本接受前调用 `pending_input(final=True)`：宿主在同一锁内返回待处理输入，或设置 `run.accepting_input=false` 关闭接收，避免结束瞬间丢补充。
+
+停止优先于纠偏；未应用输入保留，下一次明确继续时进入上下文。前一轮的 pending 输入先于更新的用户任务加入历史。若新任务已被接受但工作线程尚未启动就退出，恢复会先补旧纠偏，再补新任务，以维持指令先后顺序。`applied_input_ids` 保留最近 512 个 ID，持久化记录的 applied 状态也阻止旧输入被重复消费。
+
+正文来源编号是前端呈现：内部 ID、原始消息和 URL 保持原样。转换要求 source ID 与 URL 都匹配，复制时使用 Markdown AST 的标签位置，不替换代码、URL 或普通文字。当前计划中的已知来源也呈现为编号及可读标题。无匹配来源只能提示待核对。

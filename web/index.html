@@ -69,15 +69,24 @@
       </section>
 
       <div class="composer-region">
+        <section class="work-plan-panel" id="work-plan-panel" aria-label="当前目标与计划" hidden>
+          <div class="work-plan-heading"><span id="work-plan-label">当前目标</span><small id="work-plan-check"></small></div>
+          <strong id="work-plan-goal"></strong>
+          <p class="work-plan-current-step" id="work-plan-current-step"></p>
+          <details id="work-plan-details"><summary>查看计划、依据与自检</summary><div class="work-plan-detail-body" id="work-plan-body"></div></details>
+        </section>
+        <div class="steering-receipts" id="steering-receipts" aria-live="polite" hidden></div>
         <div class="run-status" id="run-status" role="status" aria-live="polite" hidden></div>
         <p class="run-metrics" id="run-metrics" hidden></p>
+        <p class="steering-hint" id="steering-hint" hidden>可以补充目标、约束或纠正方向；当前工具结束后应用。</p>
+        <p class="composer-error" id="composer-error" role="alert" hidden></p>
         <form class="composer" id="message-form">
           <div class="attachments" id="attachments" hidden></div>
           <label class="sr-only" for="message-input">任务内容</label>
           <textarea id="message-input" rows="3" maxlength="59000" placeholder="描述你想完成的任务…"></textarea>
-          <div class="composer-toolbar"><button class="attach-button" type="button" id="attach-file"><svg class="icon"><use href="#i-clip"/></svg><span>添加文件</span></button><button class="send-button" id="send-button" type="submit" aria-label="发送消息"><svg class="icon"><use href="#i-send"/></svg></button></div>
+          <div class="composer-toolbar"><button class="attach-button" type="button" id="attach-file"><svg class="icon"><use href="#i-clip"/></svg><span>添加文件</span></button><div class="composer-actions"><button class="stop-button" id="stop-button" type="button" hidden><svg class="icon"><use href="#i-stop"/></svg><span>停止</span></button><button class="send-button" id="send-button" type="submit" aria-label="发送消息"><svg class="icon"><use href="#i-send"/></svg></button></div></div>
         </form>
-        <p class="keyboard-hint">Enter 发送 · Shift + Enter 换行<span class="runtime-version" id="runtime-version"></span></p>
+        <p class="keyboard-hint"><span id="keyboard-action-hint">Enter 发送 · Shift + Enter 换行</span><span class="runtime-version" id="runtime-version"></span></p>
       </div>
     </main>
   </div>

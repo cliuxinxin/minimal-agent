@@ -343,3 +343,143 @@ test("source reference validation ignores ordinary links and accepts canonical U
   const result = convertMessage(message, 0, context(message));
   assert.deepEqual(result.metadata.custom.unmatchedSources, []);
 });
+
+
+const workbench = await productionModule("src/workbench-data.ts");
+
+test("readable citations require both source ID and canonical URL and keep stable per-message numbers", () => {
+  assert.equal(typeof workbench.sourceReference, "function");
+  const sources = workbench.normalizeSources([
+    { id: "S012345abcdef", title: "官方指南", url: "https://example.com/guide", read: true },
+    { id: "Sabcdef012345", title: "另一资料", url: "https://other.example/page", read: false },
+  ]);
+  assert.equal(workbench.sourceReference("Sabcdef012345", "https://other.example/page", sources).number, 2);
+  assert.equal(workbench.sourceReference("S012345abcdef", "https://EXAMPLE.com/guide", sources).source.title, "官方指南");
+  assert.equal(workbench.sourceReference("S012345abcdef", "https://evil.example/guide", sources), null);
+  assert.equal(workbench.sourceReference("Sunknown", "https://example.com/guide", sources), null);
+});
+
+test("readable copied Markdown replaces only matched source labels and preserves code and destinations", () => {
+  assert.equal(typeof workbench.readableSourceMarkdown, "function");
+  const sources = workbench.normalizeSources([{ id: "S012345abcdef", title: "官方指南", url: "https://example.com/a", read: true }]);
+  const literal = "[S012345abcdef](https://example.com/a)";
+  const text = "根据 " + literal + "。\n`" + literal + "`\n```md\n" + literal + "\n```\n[普通链接](https://example.com/a)";
+  assert.equal(workbench.readableSourceMarkdown(text, sources),
+    "根据 [1](https://example.com/a)。\n`" + literal + "`\n```md\n" + literal + "\n```\n[普通链接](https://example.com/a)");
+});
+
+test("unmatched hashed references never receive a trusted number in copied Markdown", () => {
+  assert.equal(typeof workbench.readableSourceMarkdown, "function");
+  const sources = workbench.normalizeSources([{ id: "S012345abcdef", title: "官方指南", url: "https://example.com/a", read: true }]);
+  assert.equal(workbench.readableSourceMarkdown("[S012345abcdef](https://wrong.example/a)", sources), "[来源待核对](https://wrong.example/a)");
+});
+
+const publicPlan = { goal: "只采用官方资料", success_criteria: ["每项结论可追溯"],
+  steps: [{ title: "读取原文", status: "in_progress" }, { title: "整理结果", status: "pending" }],
+  summary: "已有一份官方资料，继续核对发布时间。", evidence: ["S012345abcdef"], uncertainties: ["尚未核对第二来源"],
+  verification: { status: "not_checked", summary: "整理后逐项检查。" }, revision: 2, updated_at: "2026-10-26T00:00:00Z" };
+
+test("work plan snapshots stay with their original message while a later run changes its goal", () => {
+  const message = { role: "assistant", run_id: "old", status: "completed", content: "旧任务", work_plan: publicPlan,
+    steering: [{ id: "direction-one", run_id: "old", message: "只采用官方资料", status: "applied", created_at: "2026-10-26T00:00:00Z" }] };
+  const result = convertMessage(message, 0, { sessionId: "session", messages: [message], run: { id: "new", status: "running" },
+    work_plan: { ...publicPlan, goal: "新任务" } });
+  assert.equal(result.metadata.custom.workPlan?.goal, "只采用官方资料");
+  assert.equal(result.metadata.custom.steering?.[0].status, "applied");
+  assert.equal(message.work_plan.goal, "只采用官方资料");
+});
+
+test("copy uses readable canonical final answer without altering native segment content", () => {
+  const text = "见 [S012345abcdef](https://example.com/a)";
+  const message = { role: "assistant", run_id: "sources", status: "completed", content: text,
+    segments: [{ id: "text", type: "text", text, step: 1 }],
+    sources: [{ id: "S012345abcdef", title: "官方指南", url: "https://example.com/a", read: true }] };
+  const result = convertMessage(message, 0, context(message));
+  assert.equal(result.metadata.custom.copyAnswer, "见 [1](https://example.com/a)");
+  assert.equal(result.content[0].text, text);
+  assert.equal(message.content, text);
+});
+
+test("plan normalization does not turn a missing self-check into passed", () => {
+  assert.equal(typeof workbench.normalizeWorkPlan, "function");
+  assert.equal(workbench.normalizeWorkPlan({ ...publicPlan, verification: null }).verification.status, "not_checked");
+  assert.equal(workbench.normalizeWorkPlan({ ...publicPlan, goal: "" }), null);
+  const normalized = workbench.normalizeWorkPlan({ ...publicPlan, summary: "x".repeat(9000) });
+  assert.equal(normalized.summary.length <= 1200, true);
+});
+
+
+const runControls = await productionModule("src/stop-run.ts");
+
+test("late direction acknowledgement cannot clear or mutate a different conversation draft", async () => {
+  assert.equal(typeof runControls.submitRunInput, "function");
+  let state = { sessionId: "one", runId: "run-one", revision: 1, status: "running", acceptingInput: true };
+  let resolveResponse;
+  const applied = [], errors = [];
+  const work = runControls.submitRunInput({ read: () => state, inputId: "direction-one", message: "只用官方来源",
+    request: () => new Promise((resolve) => { resolveResponse = resolve; }),
+    apply: (value) => applied.push(value), recover: async (error) => errors.push(error) });
+  state = { sessionId: "two", runId: "run-two", revision: 2, status: "running", acceptingInput: true };
+  resolveResponse({ input: { id: "direction-one", status: "pending" } });
+  assert.equal(await work, "stale");
+  assert.deepEqual(applied, []);
+  assert.deepEqual(errors, []);
+});
+
+test("a rejected direction keeps the user's draft and has no accepted callback", async () => {
+  assert.equal(typeof runControls.submitRunInput, "function");
+  const context = { sessionId: "one", runId: "run-one", revision: 1, status: "running", acceptingInput: true };
+  let draft = "不要执行第二个写入";
+  const errors = [];
+  const outcome = await runControls.submitRunInput({ read: () => context, inputId: "direction-one", message: draft,
+    request: async () => { throw new Error("任务已结束，请作为下一条消息发送。"); },
+    apply: () => { draft = ""; }, recover: async (error) => errors.push(error.message) });
+  assert.equal(outcome, "rejected");
+  assert.equal(draft, "不要执行第二个写入");
+  assert.equal(errors.length, 1);
+});
+
+test("direction requests are not sent when the host has closed input or is stopping", async () => {
+  assert.equal(typeof runControls.submitRunInput, "function");
+  for (const context of [
+    { sessionId: "one", runId: "run-one", revision: 1, status: "running", acceptingInput: false },
+    { sessionId: "one", runId: "run-one", revision: 1, status: "stopping", acceptingInput: true },
+  ]) {
+    let calls = 0;
+    assert.equal(await runControls.submitRunInput({ read: () => context, inputId: "direction-one", message: "改变目标",
+      request: async () => { calls++; }, apply: () => {}, recover: async () => {} }), "unavailable");
+    assert.equal(calls, 0);
+  }
+});
+
+test("retrying the same uncertain input keeps its id while changed text gets a new one", () => {
+  assert.equal(typeof runControls.directionRequest, "function");
+  const context = { sessionId: "one", runId: "run-one", revision: 1, status: "running" };
+  const first = runControls.directionRequest(null, context, "只读文件", () => "first");
+  const retry = runControls.directionRequest(first, context, "只读文件", () => "second");
+  const changed = runControls.directionRequest(first, context, "只读官方文件", () => "third");
+  assert.equal(retry.inputId, "first");
+  assert.equal(changed.inputId, "third");
+});
+
+test("pending input on a stopped run remains visibly pending until explicit continuation", () => {
+  assert.equal(typeof workbench.directionStatus, "function");
+  const input = { id: "one", run_id: "stopped", status: "pending", message: "变更目标", created_at: "now" };
+  assert.match(workbench.directionStatus(input, { id: "stopped", status: "cancelled" }), /待下次继续/);
+  assert.match(workbench.directionStatus({ ...input, status: "applied" }, { id: "stopped", status: "cancelled" }), /已应用到上下文/);
+});
+
+
+test("public evidence names observed sources without leaking internal hash labels into plan text", () => {
+  assert.equal(typeof workbench.readablePlanEvidence, "function");
+  const sources = workbench.normalizeSources([{ id: "S012345abcdef", title: "官方指南", url: "https://example.com/a", read: true }]);
+  assert.equal(workbench.readablePlanEvidence("参考 S012345abcdef，文件 report.csv。", sources), "参考 来源 1（官方指南），文件 report.csv。");
+  assert.equal(workbench.readablePlanEvidence("Sdeadbeef1234", sources), "未匹配的来源");
+});
+
+
+test("plan evidence translation preserves code and does not validate mismatched Markdown links", () => {
+  const sources = workbench.normalizeSources([{ id: "S012345abcdef", title: "官方指南", url: "https://example.com/a", read: true }]);
+  const input = "S012345abcdef / `S012345abcdef` / [S012345abcdef](https://wrong.example/a)";
+  assert.equal(workbench.readablePlanEvidence(input, sources), "来源 1（官方指南） / `S012345abcdef` / [来源待核对](https://wrong.example/a)");
+});

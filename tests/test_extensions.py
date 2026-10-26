@@ -27,7 +27,7 @@ class ExtensionTests(unittest.TestCase):
         (self.root / 'config.json').write_text(json.dumps(self.original))
         agent = load_agent(self.root / 'config.json', workspace=self.root / 'workspace')
         self.assertEqual(agent.max_steps, 80)
-        self.assertEqual(set(agent.tools), {'list_files', 'read_file', 'run_python', 'create_tool'})
+        self.assertEqual(set(agent.tools), {'list_files', 'read_file', 'run_python', 'create_tool', 'update_work_plan'})
         self.assertNotIn('calculate', agent.tools)
 
     def test_default_and_unlimited_limit_roundtrip_without_keys_in_response(self):
@@ -111,7 +111,7 @@ class ExtensionTests(unittest.TestCase):
             context_summary = ''
             compaction_count = 0
 
-            def run(self, task, should_stop):
+            def run(self, task, should_stop, pending_input=None):
                 for step in range(150):
                     self.on_event({'event': 'tool_result', 'step': step,
                                    'data': {'name': 'run_python', 'ok': True,

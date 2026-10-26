@@ -17,11 +17,11 @@ function ArtifactCard({ artifact }: { artifact: Artifact }) {
   </div>;
 }
 
-function SourceCard({ source }: { source: Source }) {
+function SourceCard({ source, number }: { source: Source; number: number }) {
   const date = source.date ? new Date(source.date) : null;
   const dateLabel = date && !Number.isNaN(date.getTime()) ? date.toLocaleDateString("zh-CN") : "日期未提供";
   return <a className="source-card" href={source.url} target="_blank" rel="noopener noreferrer" data-source-id={source.id}>
-    <span className="source-card-top"><span className="source-reference">{source.id}</span>
+    <span className="source-card-top"><span className="source-reference">来源 {number}</span>
       <span className={`source-read ${source.read ? "read" : ""}`}>{source.read ? <BookOpenIcon aria-hidden /> : <FileSearchIcon aria-hidden />}
         {source.read ? "已读取原文" : "搜索摘要"}</span></span>
     <strong>{source.title}<ExternalLinkIcon aria-hidden /></strong>
@@ -44,7 +44,7 @@ export function WorkbenchOutput() {
     {typeof artifactWarning === "string" && artifactWarning ? <p className="source-reference-warning" role="status">{artifactWarning}</p> : null}
     {sources && sources.length > 0 ? <section className="message-sources" aria-label="本次任务的资料来源">
       <h3>资料来源 <span>{sources.length}</span></h3>
-      <div className="source-list">{sources.map((source) => <SourceCard key={source.id} source={source} />)}</div>
+      <div className="source-list">{sources.map((source, index) => <SourceCard key={source.id} source={source} number={index + 1} />)}</div>
     </section> : null}
     {unmatched && unmatched.length > 0 ? <p className="source-reference-warning" title={unmatched.join("、")}>部分引用未匹配本次来源，请核对。</p> : null}
     {typeof summary === "string" && summary ? <p className="message-metrics" data-testid="run-metrics" title={metrics

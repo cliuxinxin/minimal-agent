@@ -367,6 +367,12 @@ class RunPresentation:
             if kind == 'checkpoint':
                 if event.get('data', {}).get('reason') == 'user':
                     self.session.pop('pending_task', None)
+                elif self.session.get('pending_task'):
+                    # Previously queued input can be applied before this run's task.
+                    # Advance the acceptance marker until the actual user checkpoint.
+                    agent = self.session['agent']
+                    self.session['pending_task'].update(history_length=len(agent.history),
+                        archive_length=len(agent.history_archive))
                 self.state.checkpoint(self.session)
                 return
             if kind in DELTA_EVENTS:
@@ -383,7 +389,13 @@ class RunPresentation:
                 return  # Native signed/encrypted blocks belong only in local history/logs.
             displayed = browser_event(safe)
             data, step = displayed.get('data', {}), self.run['step']
-            if kind == 'usage':
+            if kind in {'work_plan', 'input_applied'}:
+                if kind == 'work_plan':
+                    self.session['work_plan_run_id'] = self.run['id']
+                    self.session['detail']['work_plan'] = copy.deepcopy(safe.get('data', {}).get('plan'))
+                self.state.sync_work_state(self.session)
+                self.state.publish(self.session, 'snapshot', {'session': self.session['detail']})
+            elif kind == 'usage':
                 self.run['metrics'] = self.message['metrics'] = safe.get('data', {})
                 self.state.publish_status(self.session, self.run)
             elif kind == 'context_compaction':
@@ -398,7 +410,7 @@ class RunPresentation:
                 segment.update(call_id=data.get('id', segment['call_id']), name=data.get('name', segment['name']))
                 if kind == 'tool_call':
                     self.run['phase'] = 'running_tool'
-                    if data.get('name') not in {'list_files', 'read_file', 'web_search', 'fetch_webpage'}:
+                    if data.get('name') not in {'list_files', 'read_file', 'web_search', 'fetch_webpage', 'update_work_plan'}:
                         try:
                             self.artifact_before = self.state.artifacts.scan() if self.state.artifacts else None
                         except (OSError, ValueError):
@@ -412,7 +424,9 @@ class RunPresentation:
                 else:
                     error = data.get('error')
                     cancelled = isinstance(error, dict) and error.get('code') == 'cancelled'
-                    segment['status'] = 'completed' if data.get('ok') else ('cancelled' if cancelled else 'error')
+                    superseded = isinstance(error, dict) and error.get('code') == 'superseded_by_user'
+                    segment['status'] = ('not_executed' if superseded else 'completed' if data.get('ok')
+                                         else 'cancelled' if cancelled else 'error')
                     if 'result' in data:
                         segment['result'] = data['result']
                     if error is not None:
@@ -460,11 +474,43 @@ class WebState:
         except (OSError, ValueError, sqlite3.Error):
             self.storage_warning = '本地会话存储暂不可用；本次对话可能无法在重启后恢复。请检查磁盘和目录权限。'
 
+    def sync_work_state(self, session):
+        """Project committed agent state into bounded, redacted public snapshots."""
+        detail, agent = session['detail'], session.get('agent')
+        applied = set(getattr(agent, 'applied_input_ids', session.get('saved_applied_input_ids', [])))
+        inputs = session.setdefault('steering_inputs', [])
+        for item in inputs:
+            if item['id'] in applied and item['status'] == 'pending':
+                item.update(status='applied', applied_at=now())
+        prior_public = {item['id']: item for item in detail.get('steering', [])}
+        detail['steering'] = [
+            {**{key: item[key] for key in ('id', 'run_id', 'status', 'created_at', 'applied_at') if key in item},
+             'message': item.get('public_message', prior_public.get(item['id'], {}).get('message',
+                                redact(item['message'], session.get('secret', []))))}
+            for item in inputs]
+        run = detail.get('run')
+        if not run or session.get('work_plan_run_id') != run['id']:
+            detail['work_plan'] = None
+        by_run = {}
+        for item in detail['steering']:
+            by_run.setdefault(item['run_id'], []).append(item)
+        for message in detail['messages']:
+            if message.get('role') != 'assistant':
+                continue
+            message['steering'] = copy.deepcopy(by_run.get(message.get('run_id'), []))
+            if run and message.get('run_id') == run['id']:
+                message['work_plan'] = copy.deepcopy(detail['work_plan'])
+
     def checkpoint(self, session, *, throttled=False):
+        with self.lock:
+            return self._checkpoint_locked(session, throttled=throttled)
+
+    def _checkpoint_locked(self, session, *, throttled=False):
         timestamp = time.monotonic()
         if throttled and timestamp - session.get('last_checkpoint', 0) < 1:
             return True
         session['last_checkpoint'] = timestamp
+        self.sync_work_state(session)
         if not self.store:
             session['detail']['storage_warning'] = self.storage_warning
             return True
@@ -477,6 +523,10 @@ class WebState:
             'compaction_count': getattr(agent, 'compaction_count', 0) if agent else session.get('saved_compactions', 0),
             'revision': session.get('store_revision', 0), 'owner_pid': os.getpid(),
             'pending_task': session.get('pending_task'),
+            'work_plan': getattr(agent, 'work_plan', None) if agent else session.get('saved_work_plan'),
+            'work_plan_run_id': session.get('work_plan_run_id'),
+            'applied_input_ids': getattr(agent, 'applied_input_ids', []) if agent else session.get('saved_applied_input_ids', []),
+            'steering_inputs': session.get('steering_inputs', []),
         }
         try:
             session['store_revision'] = self.store.save(record)
@@ -498,6 +548,8 @@ class WebState:
                 detail, settings = record['detail'], record['settings']
                 detail.update(restored=True, resume_available=False, resume_reason=None)
                 run = detail.get('run')
+                applied_input_ids = list(record.get('applied_input_ids', []))
+                steering_inputs = copy.deepcopy(record.get('steering_inputs', []))
                 external = bool(run and run.get('status') in ACTIVE and record.get('owner_pid') != os.getpid()
                                 and process_alive(record.get('owner_pid')))
                 if external:
@@ -509,13 +561,25 @@ class WebState:
                     pending = record.get('pending_task')
                     if isinstance(pending, dict) and isinstance(pending.get('text'), str) and pending['text'].strip():
                         # Acceptance was durable before the worker could append its native user turn.
-                        if len(record['history']) <= pending.get('history_length', -1):
+                        missing_history = len(record['history']) <= pending.get('history_length', -1)
+                        missing_archive = len(record.get('history_archive', record['history'])) <= pending.get('archive_length', -1)
+                        # Older, unapplied direction must precede this newer accepted goal.
+                        # Otherwise a later generic continuation could wrongly revive it.
+                        earlier_inputs = [item for item in steering_inputs
+                            if item['status'] == 'pending' and item['id'] not in applied_input_ids
+                            and run and item['run_id'] != run['id']]
+                        if missing_history:
+                            history.extend({'role': 'user', 'content': item['message']} for item in earlier_inputs)
                             history.append({'role': 'user', 'content': pending['text']})
-                        if len(record.get('history_archive', record['history'])) <= pending.get('archive_length', -1):
+                        if missing_archive:
+                            archive.extend({'role': 'user', 'content': item['message']} for item in earlier_inputs)
                             archive.append({'role': 'user', 'content': pending['text']})
+                        if missing_history or missing_archive:
+                            applied_input_ids.extend(item['id'] for item in earlier_inputs)
+                            applied_input_ids = applied_input_ids[-512:]
                 if run and run.get('status') in ACTIVE and not external:
                     run.update(status='interrupted', error='上次运行因后台退出而中断，请检查已完成步骤后继续。',
-                               finished_at=now())
+                               finished_at=now(), accepting_input=False)
                     for message in detail['messages']:
                         if message.get('run_id') != run['id'] or message.get('role') != 'assistant':
                             continue
@@ -532,6 +596,10 @@ class WebState:
                            'saved_history': history, 'saved_archive': archive,
                            'saved_summary': record.get('context_summary', ''),
                            'saved_compactions': record.get('compaction_count', 0),
+                           'saved_work_plan': record.get('work_plan'),
+                           'saved_applied_input_ids': applied_input_ids,
+                           'steering_inputs': steering_inputs,
+                           'work_plan_run_id': record.get('work_plan_run_id'),
                            'store_revision': record.get('revision', 0),
                            'runtime': dict(self.runtime), 'endpoint': '', 'secret': [], 'stop': None,
                            'sequence': 0, 'run_sequence': 0, 'journal': deque(maxlen=SSE_JOURNAL_LIMIT),
@@ -569,6 +637,9 @@ class WebState:
             agent.history_archive = copy.deepcopy(session['saved_archive'])
             agent.context_summary = session['saved_summary']
             agent.compaction_count = session['saved_compactions']
+            agent.work_plan = copy.deepcopy(session.get('saved_work_plan'))
+            agent.applied_input_ids = list(session.get('saved_applied_input_ids', []))
+            agent.state_lock = self.lock
             session.update(agent=agent, endpoint=self.model(candidate).endpoint,
                            secret=[candidate.api_key.get_secret_value(),
                                    candidate.search_api_key.get_secret_value() if candidate.search_api_key else ''])
@@ -760,11 +831,13 @@ class WebState:
         except (ValueError, OSError):
             raise RequestError(400, '请先保存有效的模型配置。') from None
         timestamp, sid = now(), uuid4().hex
+        agent.state_lock = self.lock
         detail = {'id': sid, 'title': '新对话', 'provider': config.provider, 'model': config.model,
                   'max_steps': config.max_steps, 'search_enabled': bool(config.search_api_key and
                       config.search_api_key.get_secret_value().strip()),
                   'created_at': timestamp, 'updated_at': timestamp, 'messages': [], 'run': None,
-                  'resume_available': True, 'resume_reason': None, 'restored': False}
+                  'resume_available': True, 'resume_reason': None, 'restored': False,
+                  'work_plan': None, 'steering': []}
         self.sessions[sid] = {'detail': detail, 'agent': agent,
                               'settings': {**config.model_dump(exclude={'api_key', 'search_api_key'}),
                                            'search_enabled': detail['search_enabled']},
@@ -773,6 +846,7 @@ class WebState:
                               'secret': [config.api_key.get_secret_value(),
                                          config.search_api_key.get_secret_value() if config.search_api_key else ''],
                               'stop': None, 'sequence': 0, 'run_sequence': 0,
+                              'steering_inputs': [], 'work_plan_run_id': None,
                               'journal': deque(maxlen=SSE_JOURNAL_LIMIT),
                               'changed': threading.Condition(self.lock)}
         self.checkpoint(self.sessions[sid])
@@ -809,7 +883,7 @@ class WebState:
     def publish_status(self, session, run):
         self.publish(session, 'run_status', {'run_id': run['id'], **{
             key: run[key] for key in ('status', 'step', 'error', 'event_count', 'omitted_events',
-                                     'metrics', 'phase', 'last_activity_at', 'finished_at') if key in run},
+                                     'metrics', 'phase', 'last_activity_at', 'finished_at', 'accepting_input') if key in run},
             'storage_warning': session['detail'].get('storage_warning')})
 
     @staticmethod
@@ -818,7 +892,8 @@ class WebState:
             if message.get('role') == 'assistant' and message.get('run_id') == run['id']:
                 return message
         message = {'role': 'assistant', 'run_id': run['id'], 'content': '', 'status': 'running',
-                   'segments': [], 'segments_omitted': 0, 'artifacts': [], 'sources': []}
+                   'segments': [], 'segments_omitted': 0, 'artifacts': [], 'sources': [],
+                   'work_plan': None, 'steering': []}
         session['detail']['messages'].append(message)
         return message
 
@@ -831,6 +906,65 @@ class WebState:
             return [{'id': sequence, 'event': 'snapshot',
                      'data': {'session': copy.deepcopy(session['detail'])}}]
         return [frame for frame in journal if frame['id'] > cursor]
+
+    def steer(self, session, data):
+        """Durably accept a direction update; only the runner applies native input."""
+        with self.lock:
+            if (set(data) != {'run_id', 'input_id', 'message'}
+                    or not isinstance(data.get('run_id'), str)
+                    or not isinstance(data.get('input_id'), str)
+                    or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', data['input_id'])
+                    or not isinstance(data.get('message'), str)
+                    or not data['message'].strip() or len(data['message']) > 8000):
+                raise RequestError(400, '纠正内容须为 1–8000 字符的非空文本，并附带有效运行编号。')
+            inputs = session.setdefault('steering_inputs', [])
+            existing = next((item for item in inputs if item['id'] == data['input_id']), None)
+            if existing:
+                if existing['message'] != data['message'] or existing['run_id'] != data['run_id']:
+                    raise RequestError(409, '该补充编号已用于其他内容，请重新发送。')
+                self.sync_work_state(session)
+                public = next(item for item in session['detail']['steering'] if item['id'] == existing['id'])
+                return {'input': copy.deepcopy(public), 'session': session['detail']}
+            run = session['detail'].get('run')
+            if (not run or run['id'] != data['run_id'] or run['status'] != 'running'
+                    or not run.get('accepting_input', False) or session.get('external_active')
+                    or not session['detail'].get('resume_available', True)
+                    or session.get('stop') and session['stop'].is_set()):
+                raise RequestError(409, '该任务已结束、正在停止或已进入收尾；草稿仍保留，请作为后续消息发送。')
+            if (sum(item['status'] == 'pending' for item in inputs) >= 10
+                    or sum(item['run_id'] == run['id'] for item in inputs) >= 100):
+                raise RequestError(429, '补充内容较多，请等待当前补充应用后再发送，或结束后继续对话。')
+            item = {'id': data['input_id'], 'run_id': run['id'], 'message': data['message'],
+                    'public_message': redact(data['message'], session['secret']),
+                    'status': 'pending', 'created_at': now()}
+            inputs.append(item)
+            session['detail']['updated_at'] = now()
+            saved = self.checkpoint(session)
+            if not saved or not self.store or session['detail'].get('storage_warning'):
+                inputs.remove(item)
+                self.sync_work_state(session)
+                code = 409 if not saved else 503
+                raise RequestError(code, '补充尚未保存，请保留草稿，检查本地存储或刷新会话后重试。')
+            self.publish(session, 'snapshot', {'session': session['detail']})
+            public = next(entry for entry in session['detail']['steering'] if entry['id'] == item['id'])
+            return {'input': copy.deepcopy(public), 'session': session['detail']}
+
+    def pending_inputs(self, session, run, *, final=False):
+        """Read without acknowledgement, or atomically close a final answer to input."""
+        with self.lock:
+            current = session['detail'].get('run')
+            if (not current or current['id'] != run['id'] or current['status'] != 'running'
+                    or session.get('stop') and session['stop'].is_set()):
+                return []
+            applied = set(getattr(session.get('agent'), 'applied_input_ids', []))
+            pending = [{'id': item['id'], 'message': item['message'],
+                        'before_task': item['run_id'] != run['id']}
+                       for item in session.get('steering_inputs', [])
+                       if item['status'] == 'pending' and item['id'] not in applied]
+            if final and not pending:
+                run['accepting_input'] = False
+                self.publish_status(session, run)
+            return copy.deepcopy(pending)
 
     def start(self, session, data):
         message = data.get('message')
@@ -847,11 +981,13 @@ class WebState:
         previous_detail = copy.deepcopy(detail)
         run = {'id': uuid4().hex, 'status': 'running', 'step': 0, 'error': None, 'events': [],
                'started_at': now(), 'last_activity_at': now(), 'phase': 'preparing',
-               'event_count': 0, 'omitted_events': 0}
+               'event_count': 0, 'omitted_events': 0, 'accepting_input': True}
         session['stop'] = threading.Event()
         session['pending_task'] = {'text': message, 'history_length': len(session['agent'].history),
                                    'archive_length': len(getattr(session['agent'], 'history_archive', session['agent'].history))}
         detail['run'] = run
+        session['work_plan_run_id'] = None
+        session['agent'].state_lock = self.lock
         if not detail['messages']:
             detail['title'] = redact(message.strip(), session['secret'])[:28]
         detail['messages'].append({'role': 'user', 'content': redact(message, session['secret'])})
@@ -878,7 +1014,8 @@ class WebState:
         session['agent'].on_event = presentation.on_event
         diagnostic = None
         try:
-            result = session['agent'].run(message, should_stop=session['stop'].is_set)
+            result = session['agent'].run(message, should_stop=session['stop'].is_set,
+                pending_input=lambda final=False: self.pending_inputs(session, run, final=final))
             status = result.status if result.status in {'completed', 'cancelled'} else 'error'
             error = redact(result.error, session['secret'])
             answer = redact(result.answer, session['secret'])
@@ -889,6 +1026,7 @@ class WebState:
             diagnostic = exception_diagnostic(failure, phase='host_run')
             metrics = None
         with self.lock:
+            run['accepting_input'] = False
             presentation.flush()
             presentation.capture_artifacts()
             if status == 'completed':
@@ -1191,6 +1329,8 @@ class Handler(BaseHTTPRequestHandler):
                 session = state.get_session(sid)
                 if action == 'messages':
                     status, result = 202, state.start(session, data)
+                elif action == 'steer':
+                    status, result = 202, state.steer(session, data)
                 elif action == 'continue':
                     run = session['detail'].get('run')
                     if data or not run or run['status'] not in {'error', 'cancelled', 'interrupted'}:
@@ -1203,7 +1343,7 @@ class Handler(BaseHTTPRequestHandler):
                     if set(data) != {'run_id'} or not run or data['run_id'] != run['id'] or run['status'] not in ACTIVE:
                         raise RequestError(409, '运行已结束或运行编号已过期。')
                     session['stop'].set()
-                    run['status'] = 'stopping'
+                    run.update(status='stopping', accepting_input=False)
                     state.assistant_message(session, run)['status'] = 'stopping'
                     state.checkpoint(session)
                     state.publish_status(session, run)

@@ -27,7 +27,7 @@ from .tools import Tool, ToolArgs, execution_stopped, failure
 
 OUTPUT_LIMIT = 64 * 1024
 MANIFEST_LIMIT = 256 * 1024
-RESERVED = {'list_files', 'read_file', 'run_python', 'create_tool', 'web_search', 'fetch_webpage'}
+RESERVED = {'list_files', 'read_file', 'run_python', 'create_tool', 'web_search', 'fetch_webpage', 'update_work_plan'}
 WINDOWS_DEVICES = {'con', 'prn', 'aux', 'nul'} | {
     f'{prefix}{number}' for prefix in ('com', 'lpt') for number in range(1, 10)}
 _LOCKS = {}

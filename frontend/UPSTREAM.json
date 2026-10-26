@@ -51,6 +51,7 @@
     "SyntaxHighlighter uses the official PrismLight adapter with directly imported common languages so no language module or asset is fetched at runtime.",
     "The cn workspace helper is replaced with its standard clsx and tailwind-merge implementation.",
     "ToolFallback uses the host execution phase for interrupted, unexecuted, failed, and cancelled tools; missing results stay absent. Thread adds a local diagnostic disclosure using the same Base UI collapsible and button elements, with copy/download of the host-redacted report.",
-    "Thread includes local workbench output cards for validated artifacts, observed sources, and actual provider usage. Existing message primitives and Markdown rendering are retained; archived file previews remain escaped text or CSV tables."
+    "Thread includes local workbench output cards for validated artifacts, observed sources, and actual provider usage. Existing message primitives and Markdown rendering are retained; archived file previews remain escaped text or CSV tables.",
+    "Markdown source anchors show per-message numbers only when both the observed source ID and URL match. Readable copy uses Markdown AST label ranges; native messages and code blocks remain unchanged. Thread adds a collapsed public work-plan and direction-input record while the local shell exposes the current goal and separate correction/stop controls."
   ]
 }

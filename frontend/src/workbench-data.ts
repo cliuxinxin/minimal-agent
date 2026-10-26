@@ -14,6 +14,17 @@ export type Artifact = {
   download_url: string;
 };
 export type Source = { id: string; title: string; url: string; date: string | null; read: boolean };
+export type WorkPlan = {
+  goal: string; success_criteria: string[];
+  steps: { title: string; status: "pending" | "in_progress" | "completed" }[];
+  summary: string; evidence: string[]; uncertainties: string[];
+  verification: { status: "not_checked" | "needs_work" | "passed"; summary: string };
+  revision: number; updated_at: string;
+};
+export type DirectionInput = {
+  id: string; run_id: string; message: string; status: "pending" | "applied";
+  created_at: string; applied_at?: string;
+};
 export type RunMetrics = {
   model_calls: number; tool_calls: number; known_usage_calls: number; elapsed_seconds: number;
   input_tokens: number | null; output_tokens: number | null; total_tokens: number | null;
@@ -69,6 +80,105 @@ export function normalizeSources(value: unknown): Source[] {
       url, date: text(item.date, 80) || null, read: item.read === true || previous?.read === true });
   }
   return [...sources.values()];
+}
+
+export function sourceReference(label: string, href: string | undefined, sources: Source[]) {
+  const url = safeSourceUrl(href);
+  if (!url) return null;
+  const index = sources.findIndex((source) => source.id === label && new URL(source.url).href === new URL(url).href);
+  return index < 0 ? null : { number: index + 1, source: sources[index]! };
+}
+
+export const isSourceIdentifier = (value: string) => /^S[a-f0-9]{6,64}$/i.test(value);
+
+export function readablePlanEvidence(value: string, sources: Source[]): string {
+  const markdown = readableSourceMarkdown(value, sources);
+  if (!/\bS[a-f0-9]{6,64}\b/i.test(markdown)) return markdown;
+  const nodes = [...markdownParser.parse(markdown).children];
+  const edits: { start: number; end: number; text: string }[] = [];
+  while (nodes.length) {
+    const node = nodes.pop();
+    if (!node || ["link", "linkReference", "definition", "image", "imageReference"].includes(node.type)) continue;
+    if (node.type === "text") {
+      const start = node.position?.start.offset, end = node.position?.end.offset;
+      if (start !== undefined && end !== undefined) {
+        const original = markdown.slice(start, end);
+        const readable = original.replace(/\bS[a-f0-9]{6,64}\b/gi, (id) => {
+          const index = sources.findIndex((source) => source.id === id);
+          return index < 0 ? "未匹配的来源" : `来源 ${index + 1}（${sources[index]!.title}）`;
+        });
+        if (readable !== original) edits.push({ start, end, text: readable });
+      }
+    }
+    if ("children" in node) nodes.push(...node.children);
+  }
+  let result = markdown;
+  for (const edit of edits.sort((a, b) => b.start - a.start)) result = result.slice(0, edit.start) + edit.text + result.slice(edit.end);
+  return result;
+}
+
+export function readableSourceMarkdown(markdown: string, sources: Source[]): string {
+  if (!markdown.includes("[S")) return markdown;
+  const edits: { start: number; end: number; text: string }[] = [];
+  const nodes = [...markdownParser.parse(markdown).children];
+  while (nodes.length) {
+    const node = nodes.pop();
+    if (!node) continue;
+    if (node.type === "link" && node.children.length === 1 && node.children[0]?.type === "text") {
+      const label = node.children[0];
+      const reference = sourceReference(label.value, node.url, sources);
+      const start = label.position?.start.offset, end = label.position?.end.offset;
+      if (start !== undefined && end !== undefined && (reference || isSourceIdentifier(label.value))) {
+        edits.push({ start, end, text: reference ? String(reference.number) : "来源待核对" });
+      }
+    }
+    if ("children" in node) nodes.push(...node.children);
+  }
+  // Apply AST text ranges backwards. Code, destination URLs and native history stay untouched.
+  let result = markdown;
+  for (const edit of edits.sort((a, b) => b.start - a.start)) {
+    result = result.slice(0, edit.start) + edit.text + result.slice(edit.end);
+  }
+  return result;
+}
+
+const strings = (value: unknown, max: number, width: number): string[] => Array.isArray(value)
+  ? value.slice(0, max).filter((entry): entry is string => typeof entry === "string" && Boolean(entry.trim())).map((entry) => entry.slice(0, width)) : [];
+
+export function normalizeWorkPlan(value: unknown): WorkPlan | null {
+  const item = object(value);
+  const goal = text(item?.goal, 500).trim();
+  if (!item || !goal) return null;
+  const verification = object(item.verification);
+  const steps: WorkPlan["steps"] = [];
+  if (Array.isArray(item.steps)) for (const entry of item.steps.slice(0, 8)) {
+    const step = object(entry), title = text(step?.title, 200).trim();
+    if (title) steps.push({ title, status: step?.status === "completed" ? "completed" : step?.status === "in_progress" ? "in_progress" : "pending" });
+  }
+  return { goal, success_criteria: strings(item.success_criteria, 6, 300), steps,
+    summary: text(item.summary, 1200), evidence: strings(item.evidence, 8, 400), uncertainties: strings(item.uncertainties, 6, 300),
+    verification: { status: verification?.status === "passed" ? "passed" : verification?.status === "needs_work" ? "needs_work" : "not_checked",
+      summary: text(verification?.summary, 1200) }, revision: count(item.revision) ?? 0, updated_at: text(item.updated_at, 80) };
+}
+
+export function normalizeSteering(value: unknown): DirectionInput[] {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<string>(), output: DirectionInput[] = [];
+  for (const entry of value.slice(-100)) {
+    const item = object(entry), id = text(item?.id, 64), runId = text(item?.run_id, 64);
+    if (!item || !/^[A-Za-z0-9_-]{1,64}$/.test(id) || !runId || seen.has(id) || !["pending", "applied"].includes(String(item.status))) continue;
+    const message = text(item.message, 8000);
+    if (!message) continue;
+    seen.add(id);
+    output.push({ id, run_id: runId, message, status: item.status === "applied" ? "applied" : "pending",
+      created_at: text(item.created_at, 80), ...(typeof item.applied_at === "string" ? { applied_at: item.applied_at.slice(0, 80) } : {}) });
+  }
+  return output;
+}
+
+export function directionStatus(input: DirectionInput, run?: { id?: string; status?: string } | null) {
+  return input.status === "applied" ? "已应用到上下文"
+    : run?.id === input.run_id && run.status === "running" ? "已收到，等待安全步骤边界应用" : "已收到，待下次继续时应用";
 }
 
 export function unmatchedSourceReferences(markdown: string, sources: Source[]): string[] {

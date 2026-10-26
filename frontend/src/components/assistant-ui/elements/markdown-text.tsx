@@ -11,7 +11,7 @@ import {
 } from "@assistant-ui/react-markdown";
 import remarkGfm from "remark-gfm";
 import { type FC, memo, useMemo, useRef } from "react";
-import { useMessagePartText, type TextMessagePartProps } from "@assistant-ui/react";
+import { useAuiState, useMessagePartText, type TextMessagePartProps } from "@assistant-ui/react";
 import remend from "remend";
 import { SyntaxHighlighter } from "./syntax-highlighter";
 import { CheckIcon, CopyIcon } from "lucide-react";
@@ -19,6 +19,7 @@ import { CheckIcon, CopyIcon } from "lucide-react";
 import { TooltipIconButton } from "@/components/assistant-ui/elements/tooltip-icon-button";
 import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
 import { cn } from "@/lib/utils";
+import { sourceReference, isSourceIdentifier, type Source } from "@/workbench-data";
 
 type MarkdownTextProps = Partial<TextMessagePartProps> & {
   components?: Parameters<typeof memoizeMarkdownComponents>[0];
@@ -100,6 +101,19 @@ const CodeHeader: FC<CodeHeaderProps> = ({ language, code }) => {
   );
 };
 
+function SourceLink({ className, href, children, ...props }: React.ComponentProps<"a">) {
+  const sources = useAuiState((s) => s.message.metadata.custom.sources) as Source[] | undefined;
+  const label = typeof children === "string" ? children : Array.isArray(children) && children.every((child) => typeof child === "string") ? children.join("") : "";
+  const reference = sourceReference(label, href, sources || []);
+  const unknown = !reference && isSourceIdentifier(label);
+  const tooltip = reference ? `${reference.number}. ${reference.source.title} · ${new URL(reference.source.url).hostname}`
+    : unknown ? "这条引用未匹配到本次实际来源，请核对原文。" : undefined;
+  return href ? <a {...props} className={cn("aui-md-a", reference ? "source-citation" : unknown ? "source-citation unverified" : "text-primary underline underline-offset-2", className)}
+    href={href} target="_blank" rel="noopener noreferrer" referrerPolicy="no-referrer"
+    title={tooltip || props.title} aria-label={tooltip || props["aria-label"]} data-source-number={reference?.number}
+    data-source-id={reference?.source.id}>{reference ? `[${reference.number}]` : unknown ? "[来源待核对]" : children}</a> : <span>{children}</span>;
+}
+
 const defaultComponents = memoizeMarkdownComponents({
   h1: ({ className, ...props }) => (
     <h1
@@ -164,10 +178,7 @@ const defaultComponents = memoizeMarkdownComponents({
       {...props}
     />
   ),
-  a: ({ className, href, children, ...props }) => href ? (
-    <a className={cn("aui-md-a text-primary underline underline-offset-2", className)}
-      href={href} target="_blank" rel="noopener noreferrer" referrerPolicy="no-referrer" {...props}>{children}</a>
-  ) : <span>{children}</span>,
+  a: SourceLink,
   img: ({ alt }) => <span className="image-reference">[图片：{alt || "图片"}]</span>,
   blockquote: ({ className, ...props }) => (
     <blockquote

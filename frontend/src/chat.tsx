@@ -8,9 +8,9 @@ import {
 } from "@assistant-ui/react";
 import { Thread } from "./components/assistant-ui/elements/thread.aui";
 import { convertMessage, type ConversationInput } from "./message-adapter";
-export { stopCurrentRun } from "./stop-run";
+export { stopCurrentRun, submitRunInput, directionRequest } from "./stop-run";
 export { FRONTEND_VERSION, assessRuntimeCompatibility, createRuntimeDiagnostic } from "./runtime-compatibility";
-export { normalizeArtifacts, normalizeSources, normalizeMetrics, formatMetrics } from "./workbench-data";
+export { normalizeArtifacts, normalizeSources, normalizeMetrics, formatMetrics, normalizeWorkPlan, normalizeSteering, directionStatus, readablePlanEvidence } from "./workbench-data";
 type Message = ConversationInput["messages"][number];
 
 type Snapshot = {

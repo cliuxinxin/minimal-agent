@@ -52,4 +52,4 @@ def build_agent(config: _Config, *, root: Path, on_event=None, approve=None,
         tools.extend(build_search_tools(config.search_api_key.get_secret_value()))
     return Agent(model, tools, max_steps=config.max_steps, on_event=on_event,
                  approve=programming.approve if approve is None else approve,
-                 dynamic_tools=programming.load_tools, stream=stream)
+                 dynamic_tools=programming.load_tools, stream=stream, planning=True)

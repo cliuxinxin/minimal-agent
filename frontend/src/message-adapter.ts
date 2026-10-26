@@ -1,6 +1,7 @@
 import type { MessageStatus, ThreadAssistantMessagePart, ThreadMessageLike, ToolCallMessagePartStatus } from "@assistant-ui/react";
 import type { RunDiagnostic } from "./run-diagnostic";
-import { normalizeArtifacts, normalizeSources, normalizeMetrics, formatMetrics, unmatchedSourceReferences } from "./workbench-data";
+import { normalizeArtifacts, normalizeSources, normalizeMetrics, formatMetrics, unmatchedSourceReferences,
+  readableSourceMarkdown, normalizeWorkPlan, normalizeSteering } from "./workbench-data";
 
 type Segment = {
   id: string;
@@ -28,6 +29,8 @@ type Message = {
   sources?: unknown;
   metrics?: unknown;
   artifact_warning?: string;
+  work_plan?: unknown;
+  steering?: unknown;
 };
 export type ConversationInput = {
   sessionId: string | null;
@@ -145,6 +148,10 @@ export function convertMessage(message: Message, index: number, input: Conversat
         step: message.run_id === input.run?.id ? input.run?.step || 0 : diagnostic?.step || 0,
         segmentsOmitted: message.segments_omitted || 0,
         fullAnswerFallback,
+        readableFullAnswer: fullAnswerFallback ? readableSourceMarkdown(fullAnswerFallback, sources) : undefined,
+        copyAnswer: !isRunning && message.content ? readableSourceMarkdown(message.content, sources) : undefined,
+        workPlan: normalizeWorkPlan(message.work_plan),
+        steering: normalizeSteering(message.steering),
         diagnostic,
         artifacts: normalizeArtifacts(message.artifacts),
         artifactWarning: typeof message.artifact_warning === "string" ? message.artifact_warning.slice(0, 500) : undefined,

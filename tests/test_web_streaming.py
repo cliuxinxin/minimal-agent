@@ -22,7 +22,7 @@ class EventSource:
         self.context_summary = ''
         self.compaction_count = 0
 
-    def run(self, task, *, should_stop):
+    def run(self, task, *, should_stop, pending_input=None):
         self.calls += 1
         def emit(kind, step=1, **data):
             self.on_event({'event': kind, 'step': step, 'data': data})
